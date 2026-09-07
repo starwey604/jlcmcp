@@ -462,30 +462,45 @@ export async function designDiff(bridge: BridgeClient): Promise<any> {
 
 
 // ─── 15. 网表 → 原理图（官方 sch_Netlist.setNetlist）────────────────
-export const NETLIST_TYPES = ['EasyEDA', 'JLCEDA', 'Protel2', 'PADS', 'Allegro', 'DISA', 'DSNET'] as const;
+// These are the formats handled by the desktop client's import dispatcher.
+export const NETLIST_TYPES = ['EasyEDA', 'JLCEDA', 'Protel2', 'PADS', 'Allegro', 'DISA'] as const;
 
-export async function schGenerateFromNetlist(bridge: BridgeClient, params: { netlist: string; type?: string }): Promise<any> {
+export async function schGenerateFromNetlist(bridge: BridgeClient, params: {
+  netlist: string; type?: string; verifyOnly?: boolean; pageUuid?: string;
+}): Promise<any> {
   const netlist = String(params.netlist ?? '');
   if (!netlist.trim()) throw new Error('netlist 不能为空');
   const type = params.type ?? 'Protel2';
   if (!(NETLIST_TYPES as readonly string[]).includes(type)) throw new Error('不支持的网表类型: ' + type);
-  const signature = (text: string) => type === 'Protel2' ? protel2Signature(text) : text.replace(/\r/g, '').trim();
+  // Include ALL component properties: matching connectivity alone does not prove
+  // that an import changing Value, Unique ID, etc. was applied.
+  const signature = (text: string, allowEmpty = false) => type === 'Protel2'
+    ? protel2Signature(text, { includeAllProperties: true, allowEmpty }) : text.replace(/\r/g, '').trim();
   const expected = signature(netlist);
   const before: any = await bridge.executeRaw(
     'const page = await eda.dmt_Schematic.getCurrentSchematicPageInfo();' +
     'if (!page) throw new Error("请先打开目标原理图页");' +
-    'return { pageUuid: page.uuid, netlist: await eda.sch_Netlist.getNetlist(' + JSON.stringify(type) + ') };');
-  // The beta setter returns void even on a no-op. Read back and verify logical content.
-  const after: any = await bridge.executeRaw(
+    (params.pageUuid ? 'if (page.uuid !== ' + JSON.stringify(params.pageUuid) + ') throw new Error("当前原理图页不是指定的验证/导入目标");' : '') +
+    'return { pageUuid: page.uuid, schematicUuid: page.parentSchematicUuid, netlist: await eda.sch_Netlist.getNetlist(' + JSON.stringify(type) + ') };');
+  if (typeof before.netlist !== 'string') throw new Error('原理图网表读取失败');
+  const matches = signature(before.netlist, true) === expected;
+  const result = { type, pageUuid: before.pageUuid, schematicUuid: before.schematicUuid, netlistLength: netlist.length,
+    comparisonScope: type === 'Protel2' ? 'all_component_properties_and_pin_nets' : 'normalized_text',
+    logicalContentMatches: type === 'Protel2' ? protel2Signature(before.netlist, { allowEmpty: true }) === protel2Signature(netlist) : undefined };
+  if (params.verifyOnly || matches) return { ...result, ok: matches, verified: matches, submitted: false, changed: false,
+    status: params.verifyOnly ? (matches ? 'verified' : 'mismatch') : 'unchanged',
+    note: matches ? '当前原理图网表与输入一致，本次未调用导入接口。' : '当前网表仍与输入不同，本次仅回读验证；请检查客户端导入结果及日志。' };
+
+  // LCEDA 3.2.186's setter starts an asynchronous comparison dialog and returns
+  // before Apply Changes. It is not a synchronous document mutation. In this
+  // client the schematic comparator updates properties, not pin connectivity.
+  await bridge.executeRaw(
     'const page = await eda.dmt_Schematic.getCurrentSchematicPageInfo();' +
     'if (page?.uuid !== ' + JSON.stringify(before.pageUuid) + ') throw new Error("操作期间原理图页已切换");' +
     'await eda.sch_Netlist.setNetlist(' + JSON.stringify(type) + ',' + JSON.stringify(netlist) + ');' +
-    'return await eda.sch_Netlist.getNetlist(' + JSON.stringify(type) + ');');
-  if (typeof after !== 'string' || signature(after) !== expected)
-    throw new Error('EDA 网表更新后读取结果与输入不符；未确认导入成功。该 beta API 无法保证从 PCB 自动生成符号和导线，请检查目标原理图。');
-  return { ok: true, verified: true, changed: signature(before.netlist) !== expected, type,
-    pageUuid: before.pageUuid, netlistLength: netlist.length,
-    note: '已验证网表内容；此操作不承诺自动放置符号、生成导线或完成原理图布局。' };
+    'return true;');
+  return { ...result, ok: false, verified: false, submitted: true, changed: null, status: 'submitted', comparisonTiming: 'before_submission',
+    note: '已提交客户端网表导入请求，尚未确认完成。请检查“确认导入信息”窗口和日志；界面操作完成后，以相同输入和 pageUuid 调用本工具并设置 verifyOnly=true 回读验证。当前客户端此接口不能自动增删元件或重建导线。' };
 }
 
 /** Serialize component and pin records, using the actual pad numbers. */
@@ -510,7 +525,7 @@ export function netlistToProtel2(report: any): string {
   const result = blocks.join('\n'); protel2Signature(result); return result;
 }
 
-export async function schGenerateFromPcb(bridge: BridgeClient, params: { type?: string }): Promise<any> {
+export async function schGenerateFromPcb(bridge: BridgeClient, params: { type?: string; verifyOnly?: boolean; pageUuid?: string }): Promise<any> {
   const type = params.type ?? 'Protel2';
   if (!(NETLIST_TYPES as readonly string[]).includes(type)) throw new Error('不支持的网表类型: ' + type);
   const source: any = await bridge.executeRaw(
@@ -519,14 +534,16 @@ export async function schGenerateFromPcb(bridge: BridgeClient, params: { type?: 
     'if (!pcb || board?.pcb?.uuid !== pcb.uuid || !board?.schematic?.uuid) throw new Error("请打开有关联原理图的 PCB");' +
     'const pages = (await eda.dmt_Schematic.getAllSchematicPagesInfo()).filter(p => p.parentSchematicUuid === board.schematic.uuid);' +
     'if (!pages.length) throw new Error("关联原理图没有可打开的页面");' +
-    'return { pcbUuid: pcb.uuid, pageUuid: pages[0].uuid, netlist: await eda.pcb_Net.getNetlist(' + JSON.stringify(type) + ') };');
+    'const page = ' + (params.pageUuid ? 'pages.find(p => p.uuid === ' + JSON.stringify(params.pageUuid) + ')' : 'pages[0]') + ';' +
+    'if (!page) throw new Error("指定图页不属于当前 PCB 的关联原理图");' +
+    'return { pcbUuid: pcb.uuid, pageUuid: page.uuid, netlist: await eda.pcb_Net.getNetlist(' + JSON.stringify(type) + ') };');
   if (type === 'Protel2') protel2Signature(source.netlist);
   await bridge.executeRaw('const tab = await eda.dmt_EditorControl.openDocument(' + JSON.stringify(source.pageUuid) + '); if (!tab) throw new Error("打开目标原理图失败"); return tab;');
-  try {
-    return { ...await schGenerateFromNetlist(bridge, { netlist: source.netlist, type }), source: 'pcb_official_netlist', pcbUuid: source.pcbUuid };
-  } finally {
-    await bridge.executeRaw('return await eda.dmt_EditorControl.openDocument(' + JSON.stringify(source.pcbUuid) + ');');
-  }
+  // Keep the target page active so the asynchronously opened import dialog has
+  // the right document context. Do not switch back merely because setNetlist returned.
+  return { ...await schGenerateFromNetlist(bridge, {
+    netlist: source.netlist, type, verifyOnly: params.verifyOnly, pageUuid: source.pageUuid,
+  }), source: 'pcb_official_netlist', pcbUuid: source.pcbUuid };
 }
 
 // ─── 16. eprj3 工程检查器 ────────────────────────────────────────────
@@ -658,18 +675,22 @@ export function registerProTools(server: any, bridge: BridgeClient) {
     const data = await designDiff(bridge);
     return { content: [{ type: 'text' as const, text: JSON.stringify(data, null, 2) }] };
   });
-  server.tool('sch_generate_from_netlist', '更新当前原理图网表并读取验证结果；不能保证自动生成符号、导线或布局', {
+  server.tool('sch_generate_from_netlist', '提交当前原理图网表导入，客户端异步显示确认窗口；submitted 不等于完成。verifyOnly=true 仅回读验证，不会导入；不能自动增删元件或重建导线', {
     netlist: z.string().describe('完整网表文件内容；Protel2 需文件头、元件属性和圆括号网络记录'),
-    type: z.string().optional().describe('网表格式（默认 Protel2）'),
-  }, async ({ netlist, type }: { netlist: string; type?: string }) => {
-    const data = await schGenerateFromNetlist(bridge, { netlist, type });
+    type: z.enum(NETLIST_TYPES).optional().describe('网表格式（默认 Protel2）'),
+    verifyOnly: z.boolean().optional().describe('仅比较当前原理图与输入网表；界面导入完成后使用，默认 false'),
+    pageUuid: z.string().optional().describe('要求当前原理图页匹配此 UUID，避免在错误图页导入或验证'),
+  }, async (params: { netlist: string; type?: string; verifyOnly?: boolean; pageUuid?: string }) => {
+    const data = await schGenerateFromNetlist(bridge, params);
     return { content: [{ type: 'text' as const, text: JSON.stringify(data, null, 2) }] };
   });
 
-  server.tool('sch_generate_from_pcb', '导出当前 PCB 官方网表，更新关联原理图并读取验证；失败明确报错，不保证自动画图', {
-    type: z.string().optional().describe('网表格式（默认 Protel2）'),
-  }, async ({ type }: { type?: string }) => {
-    const data = await schGenerateFromPcb(bridge, { type });
+  server.tool('sch_generate_from_pcb', '导出当前 PCB 官方网表，打开关联原理图并提交异步导入，保留目标页；verifyOnly=true 只比较。submitted 不等于完成，不能自动画图', {
+    type: z.enum(NETLIST_TYPES).optional().describe('网表格式（默认 Protel2）'),
+    verifyOnly: z.boolean().optional().describe('打开关联原理图后仅回读比较，不提交导入；需从 PCB 页调用'),
+    pageUuid: z.string().optional().describe('指定关联原理图内的目标图页，默认第一张图页'),
+  }, async (params: { type?: string; verifyOnly?: boolean; pageUuid?: string }) => {
+    const data = await schGenerateFromPcb(bridge, params);
     return { content: [{ type: 'text' as const, text: JSON.stringify(data, null, 2) }] };
   });
 

@@ -1,5 +1,5 @@
 /** Logical content of EDA's Protel2 export; ignore property ordering and whitespace. */
-export function protel2Signature(text: string): string {
+export function protel2Signature(text: string, options: { includeAllProperties?: boolean; allowEmpty?: boolean } = {}): string {
   // Empty property values are meaningful alternating lines in EDA exports.
   const lines = text.trim().replace(/\r/g, '').split('\n').map(s => s.trim());
   if (lines.shift() !== 'PROTEL NETLIST 2.0') throw new Error('Protel2 必须包含 PROTEL NETLIST 2.0 文件头，不能使用简化的 [网络名 引脚] 格式');
@@ -20,7 +20,9 @@ export function protel2Signature(text: string): string {
         j += 2;
       }
       if (!properties.get('DESIGNATOR')) throw new Error('Protel2 元件缺少 DESIGNATOR');
-      components.push(JSON.stringify(['DESIGNATOR', 'FOOTPRINT', 'PARTTYPE'].map(k => properties.get(k) ?? '')));
+      components.push(JSON.stringify(options.includeAllProperties
+        ? [...properties.entries()].sort(([a], [b]) => a.localeCompare(b))
+        : ['DESIGNATOR', 'FOOTPRINT', 'PARTTYPE'].map(k => properties.get(k) ?? '')));
     } else {
       if (block.length < 2) throw new Error('Protel2 网络必须包含名称和引脚');
       const pins = block.slice(1).filter(Boolean).map(p => p.split(/\s+/)[0]);
@@ -29,6 +31,6 @@ export function protel2Signature(text: string): string {
       nets.push(JSON.stringify([block[0], [...new Set(pins)].sort()]));
     }
   }
-  if (!components.length) throw new Error('Protel2 缺少元件记录');
+  if (!components.length && !options.allowEmpty) throw new Error('Protel2 缺少元件记录');
   return JSON.stringify({ components: components.sort(), nets: nets.sort() });
 }

@@ -137,9 +137,13 @@ pcb_auto_route_nets 升级 — 单层障碍规避布线（绕开焊盘+clearance
 pcb_bom_export 升级 — 支持 lcscCodes 料号映射（LCSC API 受保护无法自动查询）
 
 ### 高级功能 v4 (3，v1.4 新增)
-sch_generate_from_netlist — 更新当前原理图网表并读取验证；不承诺自动生成符号、导线或布局
-sch_generate_from_pcb — 导出 PCB 官方网表并尝试更新关联原理图；beta API 无效时明确报错
+sch_generate_from_netlist — 提交客户端异步网表导入；verifyOnly=true 仅回读验证，不能自动增删元件或重建导线
+sch_generate_from_pcb — 导出 PCB 官方网表，打开并保留关联原理图页；支持仅验证，不保证自动画图
 pcb_eprj3_project_info — .eprj3 工程检查器（目录/文件：索引、原理图/PCB/面板清单、源文件记录统计）
+
+原理图导入的 `status: "submitted"` 只表示请求已提交，返回 `ok: false, verified: false, changed: null`，不代表导入完成。LCEDA 3.2.186 的接口会异步显示“确认导入信息”；检查该窗口与客户端日志，界面操作完成后再次调用 `sch_generate_from_netlist`，传入相同网表、返回的 `pageUuid` 和 `verifyOnly: true`，即可只读验证。`sch_generate_from_pcb` 的仅验证模式需从 PCB 页调用，会打开关联原理图比较当前 PCB 网表。`pageUuid` 可指定关联原理图内的目标图页。
+
+网表一致时返回 `unchanged`（无需导入）或 `verified`（仅验证成功）；不一致返回 `mismatch`。Protel2 验证包含所有元件属性和网络引脚，`logicalContentMatches` 仅比较位号、封装、型号和连接，不能单独作为成功依据。其余格式比较规范化换行后的文本。当前客户端的原理图导入比较器只处理元件属性；元件集合不匹配会中断，也不能据此重建网络连接。详细实机证据见 [LINUX-LIVE-TEST.md](LINUX-LIVE-TEST.md)。
 
 ## 项目结构
 

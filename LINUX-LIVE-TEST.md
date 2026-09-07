@@ -4,7 +4,37 @@
 
 结论：MCP → Bridge → Linux EDA 链路可以运行，主要兼容问题已修复；客户端重启后，DRC 与连通性检查已完成实机验证。PCB → 原理图自动生成仍未成功，不能认定所有高级功能均正常。
 
-## 客户端重启后的复测（2026-09-07，最新状态）
+## 提交基线后的继续排查（2026-09-07，最新状态）
+
+按用户要求，先以本机 Git 身份 `WindWeaver <moonbite233@gmail.com>` 提交当时全部更改：`8358366 fix: restore LCEDA desktop MCP compatibility and validate automation`。以下排查和修复发生在该提交之后。
+
+### 原理图导入的实际行为
+
+本机 UI 包 `/opt/lceda-pro/resources/app/assets/pro-ui/3.2.181.db96fbff/js/ui.js` 的调用链为 `SCH_Netlist.setNetlist → Yre → qMe → import-netlist`。`Yre` 没有等待 `qMe`，后者异步比较数据并打开“确认导入信息”。因此 setter 返回不代表用户界面已应用修改。实测 setter 刚返回时窗口尚未出现，3 秒后的 DOM 已能读取到该窗口。
+
+此外，原理图导入使用的 `JGe.compare()` 在元件键集合不同的情况下中断并显示需要手动修改的提示；集合相同时只调用元件属性比较，没有调用网络连接比较。Protel2 解析器以位号作为匹配键，测试原理图导出的 Unique ID 为 `gge1/gge2`；这条路径存在匹配差异。实机 PCB 导入时确实出现“原理图 Schematic2 和 网表 部分差异需要手动修改”的提示，确认窗口没有变更行。
+
+这修正了前次记录中“beta setter 无效”的过度概括：**存在异步界面流程和原理图导入能力限制，不能把立即回读不变解释成同步写入失败，也不能把原样写回后相同解释成已验证 setter 能修改设计。** 当前接口不能当作 PCB 自动生成原理图的实现。
+
+### 本轮修复与验证
+
+- `sch_generate_from_netlist` 返回 `submitted / unchanged / verified / mismatch`，仅提交导入时明确 `ok=false, verified=false, changed=null`，不进行过早的完成判定。
+- 新增 `verifyOnly`，用于界面导入完成后的独立只读比较；`pageUuid` 检查目标图页。相同内容直接返回 `unchanged`，不再弹出多余窗口。
+- Protel2 验证包含所有元件属性，避免只改 Value 或 Unique ID 时误报成功；空白目标原理图可正常返回不匹配。`logicalContentMatches` 只表示位号、封装、型号和连接相同，不能替代完整验证。
+- PCB 导入保留关联原理图页，避免 setter 返回后立即切回 PCB。可用 `pageUuid` 选择关联原理图内的目标图页，也支持仅比较模式。
+- 从导入格式列表移除客户端导入分支未处理的 `DSNET`。
+
+TypeScript 构建通过，**31/31 缺陷回归通过**。真实 MCP 调用也验证了相同内容不弹窗、属性差异不会误报成功、只读验证不提交导入、PCB 提交后保留正确目标页，并观察到客户端异步确认窗口。测试结束取消了本轮窗口，完整属性和网络回读与测试前一致，已返回测试 PCB；当时 Bridge 为 1 个在线窗口、0 个待处理请求。
+
+本轮未修改 Bridge；基线提交已有 80/80 隔离 Bridge 检查通过的记录。新增实机证据保存于 `/tmp/jlcmcp-live-20260907/import-fixed-live.log`、`import-fixed-before.txt`、`import-fixed-after.txt`、`import-ui-*.json` 和累计 `results.jsonl`。
+
+### 仍未解决的格式导出超时
+
+再次显式调用 `sch_Netlist.getNetlist('JLCEDA')`，仍在 30 秒超时；Protel2 可正常导出。本机 SDK 的 JLCEDA/EasyEDA 分支会额外逐元件调用 `/PrjDB/footprint/getDisplayTitleById`，而 Protel2 分支没有这一步。
+
+诊断时，直接对测试原理图调用本机 UI 使用的 `sch/getSpecifiedTypeNetlistBySchematicId`，**705 ms 返回完整 JLCEDA JSON**，包含两个元件、真实引脚、网络和 `FootprintName`。对 SDK 使用的同一窗口封装名称 RPC 单独执行带时限探测，**3001 ms 仍未响应**。这把问题进一步收窄到了 SDK 补全封装名称所走的消息通路；尚未修改客户端 SDK，也没有在生产工具中引入内部消息总线替代官方 API。默认继续使用 Protel2。证据为 `import-native-backend.json`、`import-native-footprint-rpc.json`，均位于上述临时证据目录。
+
+## 客户端重启后的复测（2026-09-07，历史记录）
 
 用户重启 LCEDA 后，Bridge 重新连接一个真实窗口；通过 API 打开原专用测试工程，继续复测上轮未完成的项目。
 

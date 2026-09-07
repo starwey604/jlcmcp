@@ -205,11 +205,81 @@ test('schematic state uses each component pin API and netlist export defaults to
   assert.equal((await execute(eda,'get_schematic_state')).pins.length,1);assert.equal((await execute(eda,'get_netlist')).type,'Protel2');
 });
 
-test('Protel2 import rejects simplified format and detects a setter that silently does nothing',async()=>{
-  const original='PROTEL NETLIST 2.0\n[\nDESIGNATOR\nR1\nDESCRIPTION\n\nPARTTYPE\nRES\nValue\n\n\n*\n]\n(\nGND\nR1-2 res-2 Input\n)';
-  const eda={dmt_Schematic:{getCurrentSchematicPageInfo:async()=>({uuid:'sch'})},sch_Netlist:{getNetlist:async()=>original,setNetlist:async()=>{}}};
-  const bridge={executeRaw:code=>new AsyncFunction('eda',code)(eda)};
+const originalNetlist='PROTEL NETLIST 2.0\n[\nDESIGNATOR\nR1\nDESCRIPTION\n\nPARTTYPE\nRES\nValue\n\n\n*\n]\n(\nGND\nR1-2 res-2 Input\n)';
+function schematicFixture() {
+  const state={netlist:originalNetlist,setCalls:0,reads:0,page:'sch',opened:[]};
+  const eda={
+    dmt_Schematic:{getCurrentSchematicPageInfo:async()=>state.page==='pcb'?undefined:{uuid:state.page,parentSchematicUuid:'schematic'},
+      getAllSchematicPagesInfo:async()=>[{uuid:'sch',parentSchematicUuid:'schematic'}]},
+    dmt_Board:{getCurrentBoardInfo:async()=>({pcb:{uuid:'pcb'},schematic:{uuid:'schematic'}})},
+    dmt_Pcb:{getCurrentPcbInfo:async()=>state.page==='pcb'?{uuid:'pcb'}:undefined},
+    dmt_EditorControl:{openDocument:async id=>{state.opened.push(id);state.page=id;return id;}},
+    pcb_Net:{getNetlist:async()=>originalNetlist.replace('GND','VCC')},
+    sch_Netlist:{getNetlist:async()=>{state.reads++;return state.netlist;},setNetlist:async()=>{state.setCalls++;}},
+  };
+  return {state,eda,bridge:{executeRaw:code=>new AsyncFunction('eda',code)(eda)}};
+}
+
+test('Protel2 import rejects simplified input and unsupported desktop import formats before any EDA call',async()=>{
+  const {bridge,state}=schematicFixture();
   assert.throws(()=>protel2Signature('[GND\nR1-2\n]'),/文件头/);
-  await assert.rejects(pro.schGenerateFromNetlist(bridge,{netlist:original.replace('GND','VCC')}),/读取结果与输入不符/);
-  const result=await pro.schGenerateFromNetlist(bridge,{netlist:original});assert.equal(result.verified,true);assert.equal(result.changed,false);
+  await assert.rejects(pro.schGenerateFromNetlist(bridge,{netlist:'[GND\nR1-2\n]'}),/文件头/);
+  await assert.rejects(pro.schGenerateFromNetlist(bridge,{netlist:originalNetlist,type:'DSNET'}),/不支持/);
+  assert.equal(state.reads,0);assert.equal(state.setCalls,0);
+});
+
+test('asynchronous native import submission is not mistaken for completion or failure',async()=>{
+  const {bridge,state}=schematicFixture();
+  const result=await pro.schGenerateFromNetlist(bridge,{netlist:originalNetlist.replace('GND','VCC')});
+  assert.equal(result.status,'submitted');assert.equal(result.submitted,true);assert.equal(result.ok,false);
+  assert.equal(result.verified,false);assert.equal(result.changed,null);assert.equal(state.setCalls,1);
+  assert.equal(state.reads,1); // No premature readback while the native dialog is opening.
+});
+
+test('identical Protel2 contents skip the setter instead of opening an unnecessary native dialog',async()=>{
+  const {bridge,state}=schematicFixture();
+  const result=await pro.schGenerateFromNetlist(bridge,{netlist:originalNetlist.replaceAll('\n','\r\n')});
+  assert.equal(result.status,'unchanged');assert.equal(result.verified,true);assert.equal(result.changed,false);
+  assert.equal(result.submitted,false);assert.equal(state.setCalls,0);
+});
+
+test('read-only verification detects property-only failures and can verify a later applied import',async()=>{
+  const {bridge,state}=schematicFixture();
+  const desired=originalNetlist.replace('Value\n\n','Value\n10k\n');
+  const pending=await pro.schGenerateFromNetlist(bridge,{netlist:desired});
+  assert.equal(pending.status,'submitted');assert.equal(pending.logicalContentMatches,true);
+  const mismatch=await pro.schGenerateFromNetlist(bridge,{netlist:desired,verifyOnly:true,pageUuid:'sch'});
+  assert.equal(mismatch.status,'mismatch');assert.equal(mismatch.verified,false);assert.equal(mismatch.submitted,false);
+  state.netlist=desired;
+  const verified=await pro.schGenerateFromNetlist(bridge,{netlist:desired,verifyOnly:true,pageUuid:'sch'});
+  assert.equal(verified.status,'verified');assert.equal(verified.verified,true);assert.equal(state.setCalls,1);
+});
+
+test('native empty schematic exports are valid observations when checking a nonempty target',async()=>{
+  const {bridge,state}=schematicFixture();state.netlist='PROTEL NETLIST 2.0\r\n';
+  const result=await pro.schGenerateFromNetlist(bridge,{netlist:originalNetlist,verifyOnly:true});
+  assert.equal(result.status,'mismatch');assert.equal(result.logicalContentMatches,false);assert.equal(state.setCalls,0);
+});
+
+test('wrong target page and document switches are rejected before the setter',async()=>{
+  const {bridge,state,eda}=schematicFixture();
+  await assert.rejects(pro.schGenerateFromNetlist(bridge,{netlist:originalNetlist,verifyOnly:true,pageUuid:'another'}),/指定/);
+  let reads=0;
+  eda.dmt_Schematic.getCurrentSchematicPageInfo=async()=>({uuid:reads++?'another':'sch'});
+  await assert.rejects(pro.schGenerateFromNetlist(bridge,{netlist:originalNetlist.replace('GND','VCC')}),/已切换/);
+  assert.equal(state.setCalls,0);
+});
+
+test('PCB import keeps the target schematic active and forwards MCP verification options',async()=>{
+  const {bridge,state}=schematicFixture();state.page='pcb';
+  const handlers=new Map();pro.registerProTools({tool:(n,d,s,h)=>handlers.set(n,h)},bridge);
+  const invoke=async(args)=>JSON.parse((await handlers.get('sch_generate_from_pcb')(args)).content[0].text);
+  await assert.rejects(invoke({pageUuid:'unrelated'}),/不属于/);assert.deepEqual(state.opened,[]);
+  const result=await invoke({pageUuid:'sch'});
+  assert.equal(result.status,'submitted');assert.equal(result.pcbUuid,'pcb');assert.equal(result.pageUuid,'sch');
+  assert.deepEqual(state.opened,['sch']);assert.equal(state.page,'sch');assert.equal(state.setCalls,1);
+  state.page='pcb';const mismatch=await invoke({verifyOnly:true,pageUuid:'sch'});
+  assert.equal(mismatch.status,'mismatch');assert.equal(state.setCalls,1);assert.equal(state.page,'sch');
+  const direct=JSON.parse((await handlers.get('sch_generate_from_netlist')({netlist:originalNetlist,verifyOnly:true,pageUuid:'sch'})).content[0].text);
+  assert.equal(direct.status,'verified');assert.equal(state.setCalls,1);
 });
