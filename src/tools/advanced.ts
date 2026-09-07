@@ -7,7 +7,7 @@ export function registerAdvancedTools(server: any, bridge: BridgeClient) {
     posNet: z.string().describe('正极网络名'),
     negNet: z.string().describe('负极网络名'),
   }, async ({ name, posNet, negNet }: { name: string; posNet: string; negNet: string }) => {
-    const data = await bridge.command('create_differential_pair', { name, posNet, negNet });
+    const data = await bridge.command('create_differential_pair', { name, positiveNet: posNet, negativeNet: negNet });
     return { content: [{ type: 'text' as const, text: JSON.stringify(data ?? { success: true }, null, 2) }] };
   });
 

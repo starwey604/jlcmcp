@@ -40,6 +40,10 @@ function extractFunctions(src) {
 }
 
 const fns = extractFunctions(source);
+// 当前官方 API 的维护入口；覆盖归档插件中同名处理器，生成步骤不会丢失修复。
+for (const [name, fn] of extractFunctions(fs.readFileSync(path.join(ROOT, 'src/codegen/handlers.ts'), 'utf8'))) {
+  fns.set(name, fn);
+}
 
 // ─── 2. TS → JS（transpileModule 剥离类型）───────────────────────────
 function toJs(tsText) {
@@ -109,6 +113,8 @@ const DISPATCH = {
   get_netlist: 'getNetlist',
   run_sch_drc: 'runSchDrc',
   create_pcb_component: 'createPcbComponent',
+  select_component: 'selectComponent',
+  delete_selected: 'deleteSelected',
 };
 
 // 全局常量替换（避免引用插件基础设施）

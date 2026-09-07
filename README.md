@@ -36,8 +36,8 @@ AI IDE ──stdio(MCP)──> mcp-server ──HTTP /execute──> 官方 Brid
 
 ```bash
 npm install
+npm run port         # 修改 handlers.ts 后重新生成代码模板
 npm run build        # tsc 编译
-npm run port         # （可选）从 legacy-jlc-bridge 重新生成代码模板
 npm run start:bridge # （可选）手动启动官方 Bridge Server；MCP server 也会自动拉起
 npm run test:bridge  # 端到端协议冒烟测试（无需真实 EDA，内置 mock）
 ```
@@ -119,26 +119,26 @@ pcb_execute_code — 在 EDA 内直接执行任意 eda.* 官方 API 代码（高
 pcb_bom_export — 导出 PCB BOM（JSON + CSV，按元件名聚合数量/位号/网络）
 pcb_net_connectivity_check — 网络连通性检查（标记未布线/单焊盘网络）
 pcb_current_density_report — 各网络载流能力估算（IPC-2221），标记偏低网络
-pcb_fanout_component — 为指定元件所有焊盘创建扇出过孔
-pcb_auto_route_nets — 基础自动布线（L 型两层：顶层水平+底层垂直+过孔，需 DRC 复查）
+pcb_fanout_component — 在指定元件带网络焊盘中心创建通孔（盘中过孔模式，需工艺支持）
+pcb_auto_route_nets — 正交连接草稿，检查焊盘及铜图元外框；无可行路线则跳过，单独报告 DRC 结果
 pcb_drc_autofix — DRC 自修复（当前支持丝印冲突自动排列），返回修复前后对比
 
 ### 高级功能 v2 (4，v1.2 新增)
 pcb_component_clearance_check — 元件两两间距检查，标记低于阈值的违规对
-pcb_route_differential_pairs — 差分对自动布线（正/负网络平行 L 型，报告等长偏差）
+pcb_route_differential_pairs — 差分对双网连接草稿，保持焊盘端点并报告实际长度；不保证恒定间距或等长
 pcb_design_health_report — 一键设计健康报告（BOM+连通性+载流+DRC+间距，READY/NEEDS_WORK/POOR 评分）
 pcb_auto_fanout_and_route — 流水线：全部元件扇出 → 全部网络自动布线 → DRC → 丝印自修复
 
 ### 高级功能 v3 (4，v1.3 新增)
-pcb_auto_place_components — 自动布局：元件移动到焊盘质心（一阶优化）
+pcb_auto_place_components — 元件原点对齐自身焊盘质心；不提供按网络或拥挤度优化的自动布局
 pcb_netlist_report — 从 PCB 焊盘生成网表报告（元件→引脚→网络 / 网络→元件）
 pcb_design_snapshot / pcb_design_diff — 设计快照与差异对比（新增/移除/移动）
 pcb_auto_route_nets 升级 — 单层障碍规避布线（绕开焊盘+clearance）或两层 L 型（useVias）
 pcb_bom_export 升级 — 支持 lcscCodes 料号映射（LCSC API 受保护无法自动查询）
 
 ### 高级功能 v4 (3，v1.4 新增)
-sch_generate_from_netlist — 通过官方 sch_Netlist.setNetlist 导入网表生成原理图（EasyEDA/JLCEDA/Protel2/PADS/Allegro/DISA/DSNET）
-sch_generate_from_pcb — 一键：PCB 网表报告 → Protel2 网表 → 导入原理图生成
+sch_generate_from_netlist — 更新当前原理图网表并读取验证；不承诺自动生成符号、导线或布局
+sch_generate_from_pcb — 导出 PCB 官方网表并尝试更新关联原理图；beta API 无效时明确报错
 pcb_eprj3_project_info — .eprj3 工程检查器（目录/文件：索引、原理图/PCB/面板清单、源文件记录统计）
 
 ## 项目结构
@@ -165,8 +165,23 @@ pcb_eprj3_project_info — .eprj3 工程检查器（目录/文件：索引、原
 
 ```bash
 npm run build
-npm run test:bridge   # 75 项协议级断言（无需 EDA）
+npm run test:bridge   # 80 项协议级检查（无需 EDA）
+npm run test:regressions # 25 项缺陷回归测试（无需 EDA）
 ```
+
+冒烟测试发现已有 Bridge 时会退出，避免操作真实 EDA。Linux 上可以在隔离网络中测试，保持真实连接在线：
+
+```bash
+unshare --user --map-root-user --net --pid --fork --mount-proc sh -c 'ip link set lo up && npm run test:bridge'
+```
+
+真实 CachyOS / LCEDA 3.2.186 的结果及功能限制见 [LINUX-LIVE-TEST.md](LINUX-LIVE-TEST.md)。
+
+`pcb_fanout_component` 和 `pcb_auto_route_nets` 的过孔默认孔径为 12 mil、外径为 22 mil，可通过 `viaDrill` / `viaDiameter` 按工程规则调整。自动布线按所选外径检查过孔障碍；这些默认值不替代当前工程的 DRC。
+
+官方 API 兼容修复放在 `src/codegen/handlers.ts`，生成器优先使用这些函数覆盖旧插件模板。修改后运行 `npm run port && npm run build`；不要只修改 `generated.ts`，否则重新生成时会丢失。
+
+阻抗计算使用 [TI SLLU319 的近似模型](https://www.ti.com/lit/ug/sllu319/sllu319.pdf)，带状线几何参照 [ADI 图 7-118](https://www.analog.com/media/en/training-seminars/design-handbooks/P2%20Ch7_final.pdf)。`height` 在微带线中表示走线到参考平面的距离，在中心带状线中表示上下参考平面之间的总间距；超出对数公式正值范围会报错。载流报告按 IPC-2221 的最弱走线段估算，默认 1.4 mil 铜厚、10°C 温升，不把串联线段宽度相加。它们用于初步估算，不能代替板厂叠层及制造校核。
 
 ## 迁移说明（v0.1 → v1.0）
 

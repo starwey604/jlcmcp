@@ -19,7 +19,7 @@ export function registerRoutingTools(server: any, bridge: BridgeClient) {
     drill: z.number().describe('钻孔直径 (mil)'),
     diameter: z.number().describe('过孔外径 (mil)'),
   }, async ({ net, x, y, drill, diameter }: { net: string; x: number; y: number; drill: number; diameter: number }) => {
-    const data = await bridge.command('create_via', { net, x, y, drill, diameter });
+    const data = await bridge.command('create_via', { net, x, y, holeDiameter: drill, diameter });
     return { content: [{ type: 'text' as const, text: JSON.stringify(data ?? { success: true }, null, 2) }] };
   });
 

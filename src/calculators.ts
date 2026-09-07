@@ -47,93 +47,75 @@ export interface TraceWidthResult {
   layer: string;
 }
 
-/** 计算单端/差分阻抗 */
+function positive(value: number, name: string): number {
+  if (!Number.isFinite(value) || value <= 0) throw new Error(name + ' 必须为有限正数');
+  return value;
+}
+
+/** Logarithmic approximations, TI SLLU319 §3.3, equations 1–4.
+ * https://www.ti.com/lit/ug/sllu319/sllu319.pdf
+ * Stripline geometry uses plane separation B, as defined by ADI, Fig. 7-118:
+ * https://www.analog.com/media/en/training-seminars/design-handbooks/P2%20Ch7_final.pdf
+ * height is trace-to-plane distance for microstrip, full plane separation for stripline.
+ * These estimates are not a field solver; reject geometries outside the positive-log domain.
+ */
+function impedanceModel(params: Omit<ImpedanceParams, 'width'>) {
+  const thickness = positive(params.thickness ?? 1.4, 'thickness');
+  const height = positive(params.height, 'height');
+  const er = positive(params.er ?? 4.3, 'er');
+  if (er < 1) throw new Error('er 必须 >= 1');
+  if (!['microstrip', 'stripline', 'diff_microstrip', 'diff_stripline'].includes(params.type))
+    throw new Error('未知阻抗类型: ' + params.type);
+  const strip = params.type.endsWith('stripline');
+  if (strip && thickness >= height) throw new Error('带状线铜厚必须小于两参考平面的间距 height');
+  const diff = params.type.startsWith('diff_');
+  const spacing = diff ? positive(params.spacing ?? NaN, '差分 spacing') : params.spacing;
+  const coupling = diff ? 2 * (1 - (strip ? 0.37 : 0.48) * Math.exp(-(strip ? 2.9 : 0.96) * spacing! / height)) : 1;
+  const factor = 60 / Math.sqrt(strip ? er : 0.475 * er + 0.67) * coupling;
+  const numerator = 4 * height / (0.67 * (strip ? Math.PI : 1));
+  return { thickness, height, er, spacing, factor, numerator };
+}
+
 export function calcImpedance(params: ImpedanceParams): ImpedanceResult {
-  const W = params.width;
-  const T = params.thickness ?? 1.4;
-  const H = params.height;
-  const Er = params.er ?? 4.3;
-  const S = params.spacing ?? 0;
-
-  let Z0: number;
-
-  switch (params.type) {
-    case 'microstrip':
-      Z0 = (87 / Math.sqrt(Er + 1.41)) * Math.log(5.98 * H / (0.8 * W + T));
-      break;
-    case 'stripline':
-      Z0 = (60 / Math.sqrt(Er)) * Math.log((4 * H) / (Math.PI * (W + T)));
-      break;
-    case 'diff_microstrip': {
-      if (!params.spacing) throw new Error('差分微带线需要 spacing 参数');
-      const Z0_single = (87 / Math.sqrt(Er + 1.41)) * Math.log(5.98 * H / (0.8 * W + T));
-      Z0 = 2 * Z0_single * (1 - 0.48 * Math.exp(-0.96 * S / H));
-      break;
-    }
-    case 'diff_stripline': {
-      if (!params.spacing) throw new Error('差分带状线需要 spacing 参数');
-      Z0 = (120 / Math.sqrt(Er)) * Math.log((2 * H) / (Math.PI * (W + T + S)));
-      break;
-    }
-    default:
-      throw new Error(`未知阻抗类型: ${params.type}`);
-  }
-
-  return { impedance: Math.round(Z0 * 100) / 100, type: params.type, params };
+  const width = positive(params.width, 'width');
+  const m = impedanceModel(params);
+  const impedance = m.factor * Math.log(m.numerator / (0.8 * width + m.thickness));
+  if (!Number.isFinite(impedance) || impedance <= 0)
+    throw new Error('此几何参数超出对数近似公式适用范围，请调整叠层/线宽或使用场求解器');
+  return { impedance: Math.round(impedance * 100) / 100, type: params.type,
+    params: { ...params, thickness: m.thickness, er: m.er } };
 }
 
-/** 二分法反算线宽：给定目标阻抗，求满足条件的线宽 */
+/** Analytic inverse of the same model. Recalculate after rounding the returned width. */
 export function calcWidthForImpedance(params: WidthForImpedanceParams): WidthForImpedanceResult {
-  const target = params.targetImpedance;
-  let lo = 0.5;   // mil
-  let hi = 200;    // mil
-  const maxIter = 100;
-  const tolerance = 0.01; // Ω
-
-  for (let i = 0; i < maxIter; i++) {
-    const mid = (lo + hi) / 2;
-    const z = calcImpedance({ ...params, width: mid } as ImpedanceParams).impedance;
-    if (Math.abs(z - target) < tolerance) {
-      return { width: Math.round(mid * 100) / 100, impedance: z, error: Math.round((z - target) * 100) / 100 };
-    }
-    // 线宽越大阻抗越小，所以 z > target 时需要增大线宽
-    if (z > target) lo = mid;
-    else hi = mid;
-  }
-
-  // 返回最佳近似
-  const finalW = (lo + hi) / 2;
-  const finalZ = calcImpedance({ ...params, width: finalW } as ImpedanceParams).impedance;
-  return {
-    width: Math.round(finalW * 100) / 100,
-    impedance: finalZ,
-    error: Math.round((finalZ - target) * 100) / 100,
-  };
+  const target = positive(params.targetImpedance, 'targetImpedance');
+  const m = impedanceModel(params);
+  const rawWidth = (m.numerator / Math.exp(target / m.factor) - m.thickness) / 0.8;
+  if (!Number.isFinite(rawWidth) || rawWidth < 0.01 || rawWidth > 200)
+    throw new Error('目标阻抗在当前叠层及支持的线宽范围 0.01–200 mil 内不可达');
+  const width = Math.round(rawWidth * 100) / 100;
+  const impedance = calcImpedance({ ...params, width }).impedance;
+  return { width, impedance, error: Math.round((impedance - target) * 100) / 100 };
 }
 
-/** IPC-2221 线宽计算：给定电流，求最小线宽 */
+function copperParams(params: { thickness?: number; tempRise?: number; layer: string }) {
+  const thickness = positive(params.thickness ?? 1.4, 'thickness');
+  const tempRise = positive(params.tempRise ?? 10, 'tempRise');
+  if (!['external', 'internal'].includes(params.layer)) throw new Error('无效的铜层类型');
+  return { thickness, tempRise, k: params.layer === 'external' ? 0.048 : 0.024 };
+}
+
+/** IPC-2221: I = k ΔT^0.44 A^0.725, with copper area in mil². */
+export function calcCurrentCapacity(params: { width: number; thickness?: number; tempRise?: number; layer: 'external' | 'internal' }): number {
+  const m = copperParams(params);
+  const area = positive(params.width, 'width') * m.thickness;
+  return m.k * Math.pow(m.tempRise, 0.44) * Math.pow(area, 0.725);
+}
+
 export function calcTraceWidth(params: TraceWidthParams): TraceWidthResult {
-  const I = params.current;
-  const T_copper = params.thickness ?? 1.4; // mil
-  const dT = params.tempRise ?? 10;         // °C
-  const layer = params.layer;
-
-  // IPC-2221 公式: I = k × ΔT^b × A^c
-  const k = layer === 'external' ? 0.048 : 0.024;
-  const b = 0.44;
-  const c = 0.725;
-
-  // 反算截面积: A = (I / (k × ΔT^b))^(1/c)  单位 mil²
-  const A = Math.pow(I / (k * Math.pow(dT, b)), 1 / c);
-
-  // 线宽 = 截面积 / 铜厚
-  const W = A / T_copper;
-
-  return {
-    minWidth: Math.round(W * 100) / 100,
-    crossSection: Math.round(A * 100) / 100,
-    current: I,
-    tempRise: dT,
-    layer,
-  };
+  const current = positive(params.current, 'current');
+  const m = copperParams(params);
+  const area = Math.pow(current / (m.k * Math.pow(m.tempRise, 0.44)), 1 / 0.725);
+  return { minWidth: Math.round(area / m.thickness * 100) / 100,
+    crossSection: Math.round(area * 100) / 100, current, tempRise: m.tempRise, layer: params.layer };
 }

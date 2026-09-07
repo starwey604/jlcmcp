@@ -8,26 +8,37 @@ import { z } from 'zod';
 import { readFileSync, existsSync, readdirSync, statSync } from 'node:fs';
 import path from 'node:path';
 import { BridgeClient } from '../bridge-client.js';
+import { calcCurrentCapacity } from '../calculators.js';
+import { planRoute, pathLength, expandedBox, segmentBox, type Point, type Box, type CopperObstacle } from '../routing-geometry.js';
+import { parseSourceRecords } from '../source-records.js';
+import { protel2Signature } from '../netlist.js';
 
 // ─── 类型 ────────────────────────────────────────────────────────────
-interface Comp { designator: string; name: string; x: number; y: number; width: number; height: number; padNets: string[]; locked?: boolean; rotation?: number; }
-interface Pad { primitiveId: string; net: string; x: number; y: number; designator: string; diameter?: number; holeDiameter?: number; }
+interface Comp { designator: string; name: string; x: number; y: number; width: number; height: number; bbox?: Box; component?: any; footprint?: any; supplierId?: string; padNets: string[]; locked?: boolean; rotation?: number; }
+interface Pad { primitiveId: string; net: string; x: number; y: number; designator: string; pinNumber?: string; bbox?: Box; layer?: number; diameter?: number; holeDiameter?: number; }
 interface Track { primitiveId: string; net: string; layer: number | string; startX: number; startY: number; endX: number; endY: number; width: number; }
+interface ViaOptions { viaDrill?: number; viaDiameter?: number }
+
+function resolveViaSize(params: ViaOptions) {
+  const holeDiameter = params.viaDrill ?? 12;
+  const diameter = params.viaDiameter ?? 22;
+  if (![holeDiameter, diameter].every(Number.isFinite) || holeDiameter <= 0 || holeDiameter >= diameter)
+    throw new Error('过孔尺寸必须满足 0 < viaDrill < viaDiameter，单位 mil');
+  return { holeDiameter, diameter };
+}
 
 // IPC-2221 外层电流容量（A），与 calculators.ts 同一公式
-function ipcCurrent(areaMil2: number): number {
-  const areaMm2 = areaMil2 * 0.00064516;
-  return 0.048 * Math.pow(areaMm2, 0.44) * 1000;
-}
+
 
 // ─── 1. BOM 导出 ─────────────────────────────────────────────────────
 export async function exportBom(bridge: BridgeClient, opts?: { lcscCodes?: Record<string, string> }): Promise<any> {
   const state: any = await bridge.command('get_state');
   const comps: Comp[] = Array.isArray(state?.components) ? state.components : [];
-  const byName = new Map<string, { count: number; designators: string[]; padNets: Set<string> }>();
+  const byName = new Map<string, { name: string; footprint: string; supplierId: string; count: number; designators: string[]; padNets: Set<string> }>();
   for (const c of comps) {
-    const key = String(c.name || '(unknown)');
-    const row = byName.get(key) || { count: 0, designators: [], padNets: new Set<string>() };
+    const name = String(c.name || '(unknown)'), footprint = c.footprint?.name ?? '', supplierId = c.supplierId ?? '';
+    const key = JSON.stringify([name, footprint, supplierId, c.name ? '' : c.designator]);
+    const row = byName.get(key) || { name, footprint, supplierId, count: 0, designators: [] as string[], padNets: new Set<string>() };
     row.count += 1;
     row.designators.push(c.designator);
     for (const n of c.padNets || []) row.padNets.add(n);
@@ -35,83 +46,81 @@ export async function exportBom(bridge: BridgeClient, opts?: { lcscCodes?: Recor
   }
   const lcscCodes = opts?.lcscCodes ?? {};
   const items = Array.from(byName.entries())
-    .map(([name, v]) => ({
-      name,
+    .map(([, v]) => ({
+      name: v.name,
+      footprint: v.footprint,
       quantity: v.count,
       designators: v.designators.sort(),
       nets: Array.from(v.padNets).sort(),
-      lcscCode: lcscCodes[name] || lcscCodes[v.designators[0]] || null,
+      lcscCode: lcscCodes[v.name] || lcscCodes[v.designators[0]] || v.supplierId || null,
     }))
     .sort((a, b) => a.name.localeCompare(b.name));
   const csv = [
     'name,quantity,designators,nets,lcsc',
-    ...items.map((i) => [i.name, i.quantity, i.designators.join(' '), i.nets.join(' '), i.lcscCode || ''].join(',')),
+    ...items.map((i) => [i.name, i.quantity, i.designators.join(' '), i.nets.join(' '), i.lcscCode || '']
+      .map(v => /[",\r\n]/.test(String(v)) ? '"' + String(v).replace(/"/g, '""') + '"' : String(v)).join(',')),
   ].join('\n');
   return {
     componentCount: comps.length,
     itemCount: items.length,
     items,
     csv,
-    note: 'LCSC 料号需手动提供（LCSC API 受保护，无法自动查询）；可用 pcb_bom_export 的 lcscCodes 参数映射',
+    note: '按型号、封装和供应商料号聚合；料号优先使用 lcscCodes 覆盖，否则读取元件 SupplierId。',
   };
 }
 
 // ─── 2. 网络连通性检查 ───────────────────────────────────────────────
-export async function checkConnectivity(bridge: BridgeClient): Promise<any> {
+export async function checkConnectivity(bridge: BridgeClient, opts: { nets?: string[]; drc?: any } = {}): Promise<any> {
   const state: any = await bridge.command('get_state');
-  const netNames: string[] = Array.isArray(state?.nets) ? state.nets.map((n: any) => n.name).filter(Boolean) : [];
-  const nets: any[] = [];
-  for (const net of netNames) {
-    const padResult: any = await bridge.command('get_pads', { nets: net });
-    const padCount = Array.isArray(padResult?.pads) ? padResult.pads.length : 0;
-    const trackResult: any = await bridge.command('get_tracks', { net });
-    const trackCount = Array.isArray(trackResult?.tracks) ? trackResult.tracks.length : 0;
+  const drc: any = opts.drc ?? await bridge.command('run_drc');
+  const names = (state.nets ?? []).map((n: any) => n.name).filter((n: string) => !opts.nets?.length || opts.nets.includes(n));
+  const connectionIssues = (drc.issues ?? []).filter((i: any) => i.connectionError);
+  const unmapped = connectionIssues.some((i: any) => !i.net);
+  const nets = [];
+  for (const net of names) {
+    const { pads }: any = await bridge.command('get_pads', { nets: [net] });
+    const { tracks }: any = await bridge.command('get_tracks', { net });
+    const failures = connectionIssues.filter((i: any) => i.net === net);
     let status: string;
-    if (padCount === 0) status = 'no_pads';
-    else if (padCount === 1) status = 'single_pad';
-    else if (trackCount === 0) status = 'unrouted';
+    if (pads.length === 0) status = 'no_pads';
+    else if (pads.length === 1) status = 'single_pad';
+    else if (failures.length) status = 'unrouted';
+    else if (unmapped || (!drc.detailsAvailable && !drc.passed)) status = 'unknown';
     else status = 'routed';
-    nets.push({ net, padCount, trackCount, status });
+    nets.push({ net, padCount: pads.length, trackCount: tracks.length, status, connectionErrors: failures.length });
   }
-  const unrouted = nets.filter((n) => n.status === 'unrouted');
-  const single = nets.filter((n) => n.status === 'single_pad');
-  return {
-    totalNets: nets.length,
-    routed: nets.filter((n) => n.status === 'routed').length,
-    unrouted: unrouted.length,
-    singlePadNets: single.length,
-    nets,
-    recommendations: [
-      unrouted.length > 0 ? '以下网络需布线: ' + unrouted.map((n) => n.net).join(', ') : null,
-      single.length > 0 ? '以下网络仅 1 个焊盘（悬空）: ' + single.map((n) => n.net).join(', ') : null,
-    ].filter(Boolean),
-  };
+  return { totalNets: nets.length, routed: nets.filter(n=>n.status==='routed').length,
+    unrouted: nets.filter(n=>n.status==='unrouted').length, unknown: nets.filter(n=>n.status==='unknown').length,
+    singlePadNets: nets.filter(n=>n.status==='single_pad').length, nets,
+    source: 'eda_strict_drc', note: '连通性来自 EDA 严格 DRC 的连接检查，遵循当前工程规则配置；走线数量不代表连通。',
+    recommendations: nets.filter(n=>['unrouted','unknown'].includes(n.status)).map(n=>n.net+': '+n.status) };
 }
 
 // ─── 3. 载流能力报告 ────────────────────────────────────────────────
 export async function currentDensityReport(bridge: BridgeClient): Promise<any> {
   const state: any = await bridge.command('get_state');
-  const netNames: string[] = Array.isArray(state?.nets) ? state.nets.map((n: any) => n.name).filter(Boolean) : [];
-  const report: any[] = [];
-  for (const net of netNames) {
-    const trackResult: any = await bridge.command('get_tracks', { net });
-    const tracks: Track[] = Array.isArray(trackResult?.tracks) ? trackResult.tracks : [];
-    const padResult: any = await bridge.command('get_pads', { nets: net });
-    const padCount = Array.isArray(padResult?.pads) ? padResult.pads.length : 0;
-    let totalWidth = 0; // mil
-    for (const t of tracks) totalWidth += Number(t.width ?? 0);
-    const areaMil2 = totalWidth * 1; // 1mil 厚度铜箔近似（横截面积 ≈ 线宽 × 铜厚）
-    const capacityA = ipcCurrent(areaMil2);
-    const warning = padCount > 1 && capacityA < 0.2 ? '载流能力偏低（<200mA），建议加宽/铺铜' : null;
-    report.push({ net, padCount, trackCount: tracks.length, totalWidthMil: Math.round(totalWidth), estimatedCurrentA: Number(capacityA.toFixed(3)), warning });
+  const report = [];
+  const thicknessMil = 1.4, tempRiseC = 10;
+  for (const { name: net } of state.nets ?? []) {
+    const { tracks }: any = await bridge.command('get_tracks', { net });
+    const { pads }: any = await bridge.command('get_pads', { nets: [net] });
+    const valid = tracks.every((t: any) => Number.isFinite(t.width) && t.width > 0);
+    const estimates = valid ? tracks.map((t: any) => calcCurrentCapacity({width:t.width,thickness:thicknessMil,tempRise:tempRiseC,layer:[1,2].includes(Number(t.layer))?'external':'internal'})) : [];
+    const capacity = estimates.length ? Math.min(...estimates) : null;
+    report.push({ net, padCount:pads.length, trackCount:tracks.length,
+      minWidthMil:valid && tracks.length ? Math.min(...tracks.map((t: any)=>t.width)) : null,
+      estimatedCurrentA:capacity===null?null:Number(capacity.toFixed(3)),
+      warning:!valid?'线宽数据缺失，无法估算':capacity!==null && capacity<0.2?'最弱走线段估算载流小于 200mA':null });
   }
-  return { totalNets: report.length, report, notes: '估算基于 IPC-2221 外层走线，铜厚 1oz 假设；总宽度=该网络所有线段宽度之和' };
+  return {totalNets:report.length,report,assumptions:{thicknessMil,tempRiseC},
+    notes:'IPC-2221 走线段估算：取各段容量最小值，不累加串联走线宽度；未校核过孔、铺铜、分流和实际散热。'};
 }
 
 // ─── 4. 元件焊盘扇出 ────────────────────────────────────────────────
-export async function fanoutComponent(bridge: BridgeClient, params: { designator: string }): Promise<any> {
+export async function fanoutComponent(bridge: BridgeClient, params: { designator: string } & ViaOptions): Promise<any> {
   const designator = String(params.designator || '').trim();
   if (!designator) throw new Error('designator is required');
+  const viaSize = resolveViaSize(params);
   const padResult: any = await bridge.command('get_pads');
   const pads: Pad[] = Array.isArray(padResult?.pads) ? padResult.pads : [];
   const mine = pads.filter((p) => String(p.designator || '') === designator);
@@ -119,7 +128,7 @@ export async function fanoutComponent(bridge: BridgeClient, params: { designator
   const skipped: string[] = [];
   for (const p of mine) {
     if (!p.net) { skipped.push(p.primitiveId); continue; }
-    const via = await bridge.command('create_via', { net: p.net, x: p.x, y: p.y, holeDiameter: 8, diameter: 16 });
+    const via = await bridge.command('create_via', { net: p.net, x: p.x, y: p.y, ...viaSize });
     vias.push({ pad: p.primitiveId, net: p.net, x: p.x, y: p.y, viaId: (via as any)?.primitiveId });
   }
   return {
@@ -127,6 +136,7 @@ export async function fanoutComponent(bridge: BridgeClient, params: { designator
     padCount: mine.length,
     fanoutCreated: vias.length,
     skippedNoNet: skipped.length,
+    viaSize,
     vias,
   };
 }
@@ -162,107 +172,59 @@ export async function drcAutoFix(bridge: BridgeClient): Promise<any> {
 // ─── 7. 元件间距检查 ─────────────────────────────────────────────────
 export async function componentClearanceCheck(bridge: BridgeClient, params: { minClearance?: number }): Promise<any> {
   const state: any = await bridge.command('get_state');
-  const comps: Comp[] = Array.isArray(state?.components) ? state.components : [];
-  const minClearance = params.minClearance ?? 20; // mil
-  const violations: any[] = [];
-  for (let i = 0; i < comps.length; i += 1) {
-    for (let j = i + 1; j < comps.length; j += 1) {
-      const a = comps[i];
-      const b = comps[j];
-      const dx = Math.abs(a.x - b.x) - (a.width + b.width) / 2;
-      const dy = Math.abs(a.y - b.y) - (a.height + b.height) / 2;
-      const gap = Math.max(dx, 0) === 0 && Math.max(dy, 0) === 0 ? -Math.max(-dx, -dy) : Math.hypot(Math.max(dx, 0), Math.max(dy, 0));
-      if (gap < minClearance) {
-        violations.push({ a: a.designator, b: b.designator, gapMil: Math.round(gap * 10) / 10, minClearance });
-      }
-    }
+  const comps: Comp[] = state.components ?? [];
+  const minClearance=params.minClearance??20;
+  if(!Number.isFinite(minClearance)||minClearance<0)throw new Error('最小间距必须为非负数');
+  const violations=[], unavailable=[];
+  let checkedPairs=0;
+  for(let i=0;i<comps.length;i++)for(let j=i+1;j<comps.length;j++){
+    const a=comps[i],b=comps[j],ab=a.bbox,bb=b.bbox;
+    if(!ab||!bb){unavailable.push({a:a.designator,b:b.designator});continue;}
+    const dx=Math.max(ab.minX-bb.maxX,bb.minX-ab.maxX);
+    const dy=Math.max(ab.minY-bb.maxY,bb.minY-ab.maxY);
+    const overlap=dx<0&&dy<0;
+    const gap=overlap?Math.max(dx,dy):Math.hypot(Math.max(dx,0),Math.max(dy,0));
+    checkedPairs++;
+    if(overlap||gap<minClearance)violations.push({a:a.designator,b:b.designator,gapMil:Math.round(gap*100)/100,overlap,minClearance});
   }
-  return {
-    componentCount: comps.length,
-    checkedPairs: (comps.length * (comps.length - 1)) / 2,
-    minClearance,
-    violations,
-    violationCount: violations.length,
-  };
+  return {componentCount:comps.length,checkedPairs,minClearance,violations,violationCount:violations.length,
+    unavailable,complete:unavailable.length===0,method:'official_axis_aligned_bbox',note:'使用真实轴对齐外框，旋转和复杂外形可能产生保守误报；精确检查仍以 EDA DRC 为准。'};
 }
 
 // ─── 8. 差分对布线 ───────────────────────────────────────────────────
 export async function routeDifferentialPairs(bridge: BridgeClient, params: { pairName?: string; layer?: number; width?: number; gap?: number }): Promise<any> {
-  const list: any = await bridge.command('list_differential_pairs');
-  const pairs: any[] = Array.isArray(list?.pairs) ? list.pairs : [];
-  const targets = params.pairName ? pairs.filter((p) => String(p.name) === params.pairName) : pairs;
-  const layer = params.layer ?? 1;
-  const width = params.width ?? 6;
-  const gap = params.gap ?? 8;
-
-  const routed: any[] = [];
-  for (const pair of targets) {
-    const posPads: any = await bridge.command('get_pads', { nets: pair.positiveNet });
-    const negPads: any = await bridge.command('get_pads', { nets: pair.negativeNet });
-    const pos = Array.isArray(posPads?.pads) ? posPads.pads : [];
-    const neg = Array.isArray(negPads?.pads) ? negPads.pads : [];
-    if (pos.length < 2 || neg.length < 2) {
-      routed.push({ pair: pair.name, skipped: '正/负网络焊盘不足' });
-      continue;
-    }
-    // 正网络：L 型链式连接；负网络：在正网络路径基础上横向偏移 gap（保持平行）
-    const posOrder = [...pos].sort((a: any, b: any) => a.x - b.x || a.y - b.y);
-    const negOrder = [...neg].sort((a: any, b: any) => a.x - b.x || a.y - b.y);
-    let segments = 0;
-    for (let i = 0; i < posOrder.length - 1; i += 1) {
-      const a = posOrder[i];
-      const b = posOrder[i + 1];
-      const midX = Math.round((a.x + b.x) / 2);
-      await bridge.command('route_track', { net: pair.positiveNet, points: [{ x: a.x, y: a.y }, { x: midX, y: a.y }], layer, width });
-      await bridge.command('route_track', { net: pair.positiveNet, points: [{ x: midX, y: a.y }, { x: midX, y: b.y }, { x: b.x, y: b.y }], layer, width });
-      segments += 2;
-    }
-    let negSegments = 0;
-    for (let i = 0; i < negOrder.length - 1; i += 1) {
-      const a = negOrder[i];
-      const b = negOrder[i + 1];
-      // 负网络走线整体向 y+gap 偏移，保持与正网络平行
-      const midX = Math.round((a.x + b.x) / 2);
-      await bridge.command('route_track', { net: pair.negativeNet, points: [{ x: a.x, y: a.y + gap }, { x: midX, y: a.y + gap }], layer, width });
-      await bridge.command('route_track', { net: pair.negativeNet, points: [{ x: midX, y: a.y + gap }, { x: midX, y: b.y + gap }, { x: b.x, y: b.y + gap }], layer, width });
-      negSegments += 2;
-    }
-    // 估算等长偏差（按 Manhattan 路径长度）
-    const len = (nets: any[]) => {
-      let total = 0;
-      for (let i = 0; i < nets.length - 1; i += 1) {
-        total += Math.abs(nets[i + 1].x - nets[i].x) + Math.abs(nets[i + 1].y - nets[i].y);
-      }
-      return total;
-    };
-    const posLen = len(posOrder);
-    const negLen = len(negOrder);
-    routed.push({
-      pair: pair.name,
-      positiveNet: pair.positiveNet,
-      negativeNet: pair.negativeNet,
-      positiveSegments: segments,
-      negativeSegments: negSegments,
-      positiveLengthMil: posLen,
-      negativeLengthMil: negLen,
-      lengthDeltaMil: Math.abs(posLen - negLen),
-      note: '平行 L 型走线（负网络 +' + gap + 'mil 偏移），等长偏差用 create_equal_length 校验',
-    });
+  const list:any=await bridge.command('list_differential_pairs');
+  const targets=params.pairName?list.pairs.filter((p:any)=>p.name===params.pairName):list.pairs;
+  if(params.pairName&&!targets.length)throw new Error('差分对不存在: '+params.pairName);
+  const layer=params.layer??1,width=params.width??6,gap=params.gap??8;
+  const pairs=[];
+  for(const p of targets){
+    const result=await autoRouteNets(bridge,{nets:[p.positiveNet,p.negativeNet],topLayer:layer,width,clearance:gap});
+    const pos=result.nets.find((n:any)=>n.net===p.positiveNet),neg=result.nets.find((n:any)=>n.net===p.negativeNet);
+    pairs.push({pair:p.name,positiveNet:p.positiveNet,negativeNet:p.negativeNet,
+      positiveSegments:pos?.segments??0,negativeSegments:neg?.segments??0,
+      positiveLengthMil:pos?.lengthMil??null,negativeLengthMil:neg?.lengthMil??null,
+      lengthDeltaMil:pos?.lengthMil!==undefined&&neg?.lengthMil!==undefined?Math.abs(pos.lengthMil-neg.lengthMil):null,
+      connected:!!pos?.connected&&!!neg?.connected,drcPassed:result.drcPassed,drcError:result.drcError,paths:result.nets,
+      couplingVerified:false,note:'保留真实焊盘端点的双网连接草稿；gap 用作最小规划间距，不保证恒定耦合间距或等长。'});
   }
-  return { routedPairs: routed.length, layer, width, gap, pairs: routed };
+  return {routedPairs:pairs.filter(p=>p.connected).length,layer,width,gap,pairs};
 }
 
 // ─── 9. 设计健康报告 ─────────────────────────────────────────────────
 export async function designHealthReport(bridge: BridgeClient): Promise<any> {
-  const [bom, conn, dens, drc, clear] = await Promise.all([
+  // EDA DRC is a document-level operation; run it once rather than concurrently twice.
+  const drc: any = await bridge.command('run_drc');
+  const [bom, conn, dens, clear] = await Promise.all([
     exportBom(bridge),
-    checkConnectivity(bridge),
+    checkConnectivity(bridge, { drc }),
     currentDensityReport(bridge),
-    bridge.command('run_drc'),
     componentClearanceCheck(bridge, {}),
   ]) as any[];
   const issues: string[] = [];
   if (!drc?.passed) issues.push('DRC 存在 ' + (drc?.totalCount ?? 0) + ' 个问题');
+  if (conn.unknown > 0) issues.push('有网络连通性无法确认');
+  if (!clear.complete) issues.push('部分元件缺少边界数据，无法完成间距检查');
   if ((conn as any).unrouted > 0) issues.push('存在 ' + (conn as any).unrouted + ' 个未布线网络');
   if ((conn as any).singlePadNets > 0) issues.push('存在 ' + (conn as any).singlePadNets + ' 个单焊盘网络');
   if ((clear as any).violationCount > 0) issues.push('存在 ' + (clear as any).violationCount + ' 处元件间距违规');
@@ -277,7 +239,9 @@ export async function designHealthReport(bridge: BridgeClient): Promise<any> {
       routedNets: conn.routed,
       unrouted: conn.unrouted,
       drcPassed: Boolean(drc?.passed),
-      drcIssues: Number(drc?.totalCount ?? 0),
+      drcIssues: drc?.totalCount ?? null,
+      unknownNets: conn.unknown,
+      clearanceComplete: clear.complete,
       clearanceViolations: clear.violationCount,
       currentWarnings: dens.report.filter((r: any) => r.warning).length,
     },
@@ -355,194 +319,103 @@ export async function autoPlaceComponents(bridge: BridgeClient, params: { maxMov
   }
   return {
     moved,
+    evaluatedComponents: byDesignator.size,
+    optimizationVerified: false,
     totalComponents: comps.length,
     details,
-    note: '质心布局：把每个元件移动到其焊盘质心（一阶优化），锁定元件跳过；后续可用 pcb_component_clearance_check 复核间距',
+    note: '当前操作仅将元件原点对齐自身焊盘质心，未实现按网络或拥挤度优化布局；对称封装 moved=0 是正常结果。',
   };
 }
 
 // ─── 12. 障碍规避自动布线 ───────────────────────────────────────────
-interface Obstacle { x: number; y: number; r: number; net: string; }
 
-function segCircleDist(x1: number, y1: number, x2: number, y2: number, cx: number, cy: number): number {
-  const dx = x2 - x1;
-  const dy = y2 - y1;
-  const len2 = dx * dx + dy * dy;
-  let t = len2 === 0 ? 0 : ((cx - x1) * dx + (cy - y1) * dy) / len2;
-  t = Math.max(0, Math.min(1, t));
-  const px = x1 + t * dx;
-  const py = y1 + t * dy;
-  return Math.hypot(cx - px, cy - py);
-}
 
-function segmentClear(x1: number, y1: number, x2: number, y2: number, obstacles: Obstacle[], selfNets: Set<string>): boolean {
-  for (const o of obstacles) {
-    // 同网络的焊盘不是障碍（要连到它们）
-    if (selfNets.has(o.net)) continue;
-    if (segCircleDist(x1, y1, x2, y2, o.x, o.y) < o.r) return false;
+
+
+
+
+
+
+export async function autoRouteNets(bridge: BridgeClient, params: { nets?: string[]; topLayer?: number; viaLayer?: number; width?: number; clearance?: number; useVias?: boolean } & ViaOptions): Promise<any> {
+  const viaSize = resolveViaSize(params);
+  const state:any=await bridge.command('get_state');
+  const targets=[...new Set(params.nets?.length?params.nets:(state.nets??[]).map((n:any)=>n.name))] as string[];
+  const topLayer=params.topLayer??1, viaLayer=params.viaLayer??2, width=params.width??10, clearance=params.clearance??15;
+  if(!Number.isFinite(width)||width<=0||!Number.isFinite(clearance)||clearance<0)throw new Error('线宽须为正数，间距须为非负数');
+  if(params.useVias && (topLayer===viaLayer || ![1,2].includes(topLayer) || ![1,2].includes(viaLayer)))throw new Error('双层模式要求不同的顶层/底层');
+  const layer=params.useVias?viaLayer:topLayer;
+  const {pads:allPads}:any=await bridge.command('get_pads');
+  const {tracks}:any=await bridge.command('get_tracks');
+  if (tracks.some((t:Track) => ![t.startX,t.startY,t.endX,t.endY,t.width].every(Number.isFinite) || t.width <= 0))
+    throw new Error('已有走线缺少有效坐标或线宽，不能可靠检查障碍');
+  const obstacles:CopperObstacle[]=allPads.filter((p:Pad)=>p.bbox).map((p:Pad)=>({bbox:p.bbox!,net:p.net,layer:Number(p.layer)}));
+  for(const t of tracks)obstacles.push({bbox:segmentBox({x:t.startX,y:t.startY},{x:t.endX,y:t.endY},t.width),net:t.net,layer:Number(t.layer)});
+  const other:any=await bridge.executeRaw('const out=[]; for(const type of ["Via","Arc","Pour","Fill","Region"]){const api=eda["pcb_Primitive"+type];if(!api?.getAll)continue;for(const row of await api.getAll()){const bbox=await eda.pcb_Primitive.getPrimitivesBBox([row]);if(bbox)out.push({bbox,net:row.getState_Net?.()??"",layer:type==="Via"?12:(row.getState_Layer?.()??12)});}}return out;');
+  obstacles.push(...other);
+  if(allPads.some((p:Pad)=>!p.bbox || ![p.x,p.y,p.layer].every(Number.isFinite)))throw new Error('存在无法读取外框、坐标或层号的焊盘，不能规划避障路线');
+  const summary:any[]=[];
+  let totalTrackSegments=0,totalVias=0;
+  for(const net of targets){
+    const pads:Pad[]=allPads.filter((p:Pad)=>p.net===net).sort((a:Pad,b:Pad)=>a.x-b.x||a.y-b.y);
+    if(pads.length<2){summary.push({net,pads:pads.length,segments:0,skipped:'不足两个焊盘'});continue;}
+    if(!params.useVias && pads.some(p=>p.layer!==layer&&p.layer!==12)){summary.push({net,pads:pads.length,segments:0,skipped:'焊盘跨层，须使用双层模式'});continue;}
+    const boxes=obstacles.filter(o=>o.net!==net && (o.layer===layer||o.layer===12)).map(o=>expandedBox(o.bbox,clearance+width/2));
+    const paths:Point[][]=[];
+    let failed=false;
+    for(let i=1;i<pads.length;i++){
+      const path=planRoute(pads[i-1],pads[i],boxes);
+      if(!path){failed=true;break;}
+      if(state.boardBounds && path.some(p=>p.x<state.boardBounds.minX||p.x>state.boardBounds.maxX||p.y<state.boardBounds.minY||p.y>state.boardBounds.maxY)){failed=true;break;}
+      paths.push(path);
+    }
+    const viaPads=params.useVias?pads.filter(p=>p.layer!==layer&&p.layer!==12):[];
+    const viaMargin=clearance+viaSize.diameter/2;
+    for(const p of viaPads){
+      if(obstacles.some(o=>o.net!==net && p.x>=o.bbox.minX-viaMargin && p.x<=o.bbox.maxX+viaMargin && p.y>=o.bbox.minY-viaMargin && p.y<=o.bbox.maxY+viaMargin))failed=true;
+    }
+    if(failed){summary.push({net,pads:pads.length,segments:0,skipped:'候选路径或过孔被障碍阻挡；未生成该网络走线'});continue;}
+    let segments=0,vias=0;
+    for(const p of viaPads){
+      await bridge.command('create_via',{net,x:p.x,y:p.y,...viaSize});vias++;
+      obstacles.push({bbox:segmentBox(p,p,viaSize.diameter),net,layer:12});
+    }
+    for(const path of paths){
+      const result:any=await bridge.command('route_track',{net,points:path,layer,width});segments+=result.createdSegments;
+      for(let i=1;i<path.length;i++)obstacles.push({bbox:segmentBox(path[i-1],path[i],width),net,layer});
+    }
+    totalTrackSegments+=segments;totalVias+=vias;
+    summary.push({net,pads:pads.length,segments,vias,paths,lengthMil:paths.reduce((s,p)=>s+pathLength(p),0)});
   }
-  return true;
-}
-
-function routeChainPoints(pads: Pad[], obstacles: Obstacle[], selfNets: Set<string>): { points: Array<{ x: number; y: number }>; detours: number } {
-  const ordered = [...pads].sort((a, b) => a.x - b.x || a.y - b.y);
-  const out: Array<{ x: number; y: number }> = [];
-  let detours = 0;
-  for (let i = 0; i < ordered.length - 1; i += 1) {
-    const a = ordered[i];
-    const b = ordered[i + 1];
-    if (segmentClear(a.x, a.y, b.x, b.y, obstacles, selfNets)) {
-      if (out.length === 0) out.push({ x: a.x, y: a.y });
-      out.push({ x: b.x, y: b.y });
-      continue;
-    }
-    // L 型：先水平后垂直 / 先垂直后水平
-    const l1 = [
-      { x: a.x, y: a.y },
-      { x: b.x, y: a.y },
-      { x: b.x, y: b.y },
-    ];
-    const l2 = [
-      { x: a.x, y: a.y },
-      { x: a.x, y: b.y },
-      { x: b.x, y: b.y },
-    ];
-    const l1ok = segmentClear(l1[0].x, l1[0].y, l1[1].x, l1[1].y, obstacles, selfNets) && segmentClear(l1[1].x, l1[1].y, l1[2].x, l1[2].y, obstacles, selfNets);
-    const l2ok = segmentClear(l2[0].x, l2[0].y, l2[1].x, l2[1].y, obstacles, selfNets) && segmentClear(l2[1].x, l2[1].y, l2[2].x, l2[2].y, obstacles, selfNets);
-    if (l1ok || l2ok) {
-      const path = l1ok ? l1 : l2;
-      if (out.length === 0) out.push(path[0]);
-      out.push(path[1], path[2]);
-      detours += 1;
-      continue;
-    }
-    // Z 型：垂直偏移 detour
-    const midY = Math.round((a.y + b.y) / 2);
-    const z = [
-      { x: a.x, y: a.y },
-      { x: a.x, y: midY },
-      { x: b.x, y: midY },
-      { x: b.x, y: b.y },
-    ];
-    const zok =
-      segmentClear(z[0].x, z[0].y, z[1].x, z[1].y, obstacles, selfNets) &&
-      segmentClear(z[1].x, z[1].y, z[2].x, z[2].y, obstacles, selfNets) &&
-      segmentClear(z[2].x, z[2].y, z[3].x, z[3].y, obstacles, selfNets);
-    if (zok) {
-      if (out.length === 0) out.push(z[0]);
-      out.push(z[1], z[2], z[3]);
-      detours += 1;
-      continue;
-    }
-    // 直连兜底
-    if (out.length === 0) out.push({ x: a.x, y: a.y });
-    out.push({ x: b.x, y: b.y });
-  }
-  return { points: out, detours };
-}
-
-export async function autoRouteNets(bridge: BridgeClient, params: { nets?: string[]; topLayer?: number; viaLayer?: number; width?: number; clearance?: number; useVias?: boolean }): Promise<any> {
-  const state: any = await bridge.command('get_state');
-  const allNets: string[] = Array.isArray(state?.nets) ? state.nets.map((n: any) => n.name).filter(Boolean) : [];
-  const targets = Array.isArray(params.nets) && params.nets.length > 0 ? params.nets.map(String) : allNets;
-  const topLayer = params.topLayer ?? 1;
-  const viaLayer = params.viaLayer ?? 2;
-  const width = params.width ?? 10;
-  const clearance = params.clearance ?? 15;
-  const useVias = Boolean(params.useVias);
-
-  // 障碍集合：所有焊盘（含直径），加上 clearance
-  const padResult: any = await bridge.command('get_pads');
-  const allPads: Pad[] = Array.isArray(padResult?.pads) ? padResult.pads : [];
-  const obstacles: Obstacle[] = allPads
-    .filter((p) => p.net && p.x !== undefined && p.y !== undefined)
-    .map((p) => ({ x: p.x, y: p.y, r: (p.diameter ?? 30) / 2 + clearance, net: p.net }));
-
-  const summary: any[] = [];
-  let totalTracks = 0;
-  let totalVias = 0;
-  let totalDetours = 0;
-  for (const net of targets) {
-    const pads = allPads.filter((p) => p.net === net);
-    if (pads.length < 2) { summary.push({ net, pads: pads.length, segments: 0, vias: 0, skipped: '不足 2 个焊盘' }); continue; }
-
-    if (useVias) {
-      // 两层 L 型（旧行为）
-      const ordered = [...pads].sort((a, b) => a.x - b.x || a.y - b.y);
-      let segments = 0;
-      let vias = 0;
-      for (let i = 0; i < ordered.length - 1; i += 1) {
-        const a = ordered[i];
-        const b = ordered[i + 1];
-        const midX = Math.round((a.x + b.x) / 2);
-        await bridge.command('route_track', { net, points: [{ x: a.x, y: a.y }, { x: midX, y: a.y }], layer: topLayer, width });
-        await bridge.command('create_via', { net, x: midX, y: a.y, holeDiameter: 8, diameter: 16 });
-        await bridge.command('route_track', { net, points: [{ x: midX, y: a.y }, { x: midX, y: b.y }, { x: b.x, y: b.y }], layer: viaLayer, width });
-        segments += 2;
-        vias += 1;
-      }
-      totalTracks += segments;
-      totalVias += vias;
-      summary.push({ net, pads: pads.length, segments, vias });
-    } else {
-      // 单层障碍规避
-      const { points, detours } = routeChainPoints(pads, obstacles, new Set([net]));
-      const segments = points.length - 1;
-      if (segments > 0) {
-        // 分段发送（route_track 逐段画）
-        for (let i = 0; i < points.length - 1; i += 1) {
-          await bridge.command('route_track', { net, points: [points[i], points[i + 1]], layer: topLayer, width });
-        }
-      }
-      totalTracks += segments;
-      totalDetours += detours;
-      summary.push({ net, pads: pads.length, segments, detours });
-    }
-  }
-  return {
-    routedNets: summary.length,
-    totalTrackSegments: totalTracks,
-    totalVias,
-    totalDetours,
-    mode: useVias ? 'two_layer_l' : 'single_layer_obstacle_aware',
-    note: useVias
-      ? '两层 L 型布线（顶层水平 + 底层垂直 + 过孔）'
-      : '单层障碍规避布线（自动绕开焊盘，clearance=' + clearance + 'mil）；请用 pcb_run_drc 复查',
-    nets: summary,
-  };
+  let drc:any;
+  try { drc=await bridge.command('run_drc'); }
+  catch (e:any) { drc={passed:false,detailsAvailable:false,issues:[],error:e.message}; }
+  const connectionIssues=(drc.issues??[]).filter((i:any)=>i.connectionError);
+  for(const r of summary)r.connected=!r.skipped&&(drc.detailsAvailable||drc.passed)&&!connectionIssues.some((i:any)=>!i.net||i.net===r.net);
+  return {routedNets:summary.filter(r=>r.connected).length,generatedNets:summary.filter(r=>r.segments>0).length,
+    skippedNets:summary.filter(r=>r.skipped).length,totalTrackSegments,totalVias,totalDetours:summary.filter(r=>r.paths?.some((p:Point[])=>p.length>2)).length,
+    mode:params.useVias?'two_layer_escape':'single_layer_obstacle_aware',viaSize:params.useVias?viaSize:null,drcPassed:drc.passed,drcError:drc.error??null,nets:summary,
+    note:'候选路线避开异网焊盘、已有及本轮新走线等外框；无可行路线则跳过。双层模式用目标布线层并在需要换层的焊盘处放通孔。routedNets 来自连接检查，drcPassed 为整板检查结果。'};
 }
 
 // ─── 13. PCB 网表报告 ───────────────────────────────────────────────
 export async function netlistReport(bridge: BridgeClient): Promise<any> {
-  const state: any = await bridge.command('get_state');
-  const comps: Comp[] = Array.isArray(state?.components) ? state.components : [];
-  const padResult: any = await bridge.command('get_pads');
-  const pads: Pad[] = Array.isArray(padResult?.pads) ? padResult.pads : [];
-
-  const byDesignator = new Map<string, Pad[]>();
-  for (const p of pads) {
-    if (!p.designator) continue;
-    const arr = byDesignator.get(p.designator) || [];
-    arr.push(p);
-    byDesignator.set(p.designator, arr);
+  const state: any=await bridge.command('get_state');
+  const {pads}: any=await bridge.command('get_pads');
+  const byDesignator=new Map<string,any>();
+  for(const c of state.components??[])byDesignator.set(c.designator,{designator:c.designator,name:c.name,component:c.component,footprint:c.footprint,pins:[]});
+  const unmapped=[];
+  for(const p of pads){
+    const c=byDesignator.get(p.designator);
+    if(!c||!p.pinNumber){unmapped.push(p.primitiveId);continue;}
+    c.pins.push({pin:p.pinNumber,net:p.net||'',primitiveId:p.primitiveId});
   }
-  const components = Array.from(byDesignator.entries()).map(([designator, ps]) => ({
-    designator,
-    pins: ps.map((p, i) => ({ pin: i + 1, net: p.net || '(no net)' })),
-  }));
-
-  const netToDesignators = new Map<string, string[]>();
-  for (const p of pads) {
-    if (!p.net || !p.designator) continue;
-    const arr = netToDesignators.get(p.net) || [];
-    if (!arr.includes(p.designator)) arr.push(p.designator);
-    netToDesignators.set(p.net, arr);
+  const components=[...byDesignator.values()];
+  const netMap=new Map<string,Set<string>>();
+  for(const c of components)for(const pin of c.pins)if(pin.net){
+    const set=netMap.get(pin.net)??new Set<string>();set.add(c.designator);netMap.set(pin.net,set);
   }
-  const nets = Array.from(netToDesignators.entries())
-    .map(([net, des]) => ({ net, designators: des.sort() }))
-    .sort((a, b) => a.net.localeCompare(b.net));
-
-  return { componentCount: comps.length, components, nets, note: '由 PCB 焊盘数据推导；引脚编号为近似顺序（按 get_pads 返回顺序）' };
+  return {componentCount:components.length,components,nets:[...netMap].map(([net,des])=>({net,designators:[...des].sort()})),
+    unmappedPads:unmapped,complete:unmapped.length===0,note:'使用 EDA 的焊盘所属元件及实际焊盘编号，不按返回顺序编造引脚号。'};
 }
 
 // ─── 14. 设计快照 / 差异对比 ────────────────────────────────────────
@@ -595,128 +468,104 @@ export async function schGenerateFromNetlist(bridge: BridgeClient, params: { net
   const netlist = String(params.netlist ?? '');
   if (!netlist.trim()) throw new Error('netlist 不能为空');
   const type = params.type ?? 'Protel2';
-  if (!(NETLIST_TYPES as readonly string[]).includes(type)) {
-    throw new Error('不支持的网表类型: ' + type + '（可选: ' + NETLIST_TYPES.join(', ') + '）');
-  }
-  const code =
-    'const r = await eda.sch_Netlist.setNetlist(' + JSON.stringify(type) + ', ' + JSON.stringify(netlist) + ');' +
-    'return { ok: true, type: ' + JSON.stringify(type) + ', netlistLength: ' + JSON.stringify(netlist.length) + ' };';
-  const data = await bridge.executeRaw(code);
-  return { ok: (data as any)?.ok ?? true, type, netlistLength: netlist.length, note: '已调用官方 sch_Netlist.setNetlist(' + type + ') 更新原理图网表' };
+  if (!(NETLIST_TYPES as readonly string[]).includes(type)) throw new Error('不支持的网表类型: ' + type);
+  const signature = (text: string) => type === 'Protel2' ? protel2Signature(text) : text.replace(/\r/g, '').trim();
+  const expected = signature(netlist);
+  const before: any = await bridge.executeRaw(
+    'const page = await eda.dmt_Schematic.getCurrentSchematicPageInfo();' +
+    'if (!page) throw new Error("请先打开目标原理图页");' +
+    'return { pageUuid: page.uuid, netlist: await eda.sch_Netlist.getNetlist(' + JSON.stringify(type) + ') };');
+  // The beta setter returns void even on a no-op. Read back and verify logical content.
+  const after: any = await bridge.executeRaw(
+    'const page = await eda.dmt_Schematic.getCurrentSchematicPageInfo();' +
+    'if (page?.uuid !== ' + JSON.stringify(before.pageUuid) + ') throw new Error("操作期间原理图页已切换");' +
+    'await eda.sch_Netlist.setNetlist(' + JSON.stringify(type) + ',' + JSON.stringify(netlist) + ');' +
+    'return await eda.sch_Netlist.getNetlist(' + JSON.stringify(type) + ');');
+  if (typeof after !== 'string' || signature(after) !== expected)
+    throw new Error('EDA 网表更新后读取结果与输入不符；未确认导入成功。该 beta API 无法保证从 PCB 自动生成符号和导线，请检查目标原理图。');
+  return { ok: true, verified: true, changed: signature(before.netlist) !== expected, type,
+    pageUuid: before.pageUuid, netlistLength: netlist.length,
+    note: '已验证网表内容；此操作不承诺自动放置符号、生成导线或完成原理图布局。' };
 }
 
-/** 把 PCB 网表报告转为 Protel2 格式文本 */
+/** Serialize component and pin records, using the actual pad numbers. */
 export function netlistToProtel2(report: any): string {
-  const nets = Array.isArray(report?.nets) ? report.nets : [];
-  const blocks: string[] = [];
-  for (const n of nets) {
-    const name = String(n.net || '');
-    if (!name) continue;
-    const pins = Array.isArray(n.designators) ? n.designators : [];
-    const lines = [name];
-    // 需要引脚级信息：从 components 里查
-    const comps = Array.isArray(report?.components) ? report.components : [];
-    for (const c of comps) {
-      const pinsOf = Array.isArray(c?.pins) ? c.pins : [];
-      for (const p of pinsOf) {
-        if (p.net === name) lines.push(c.designator + '-' + p.pin);
-      }
+  if (report?.complete === false) throw new Error('焊盘归属或引脚编号缺失，不能生成完整网表');
+  const safe = (value: any) => {
+    const text = String(value ?? '').trim();
+    if (!text || /[\r\n]/.test(text)) throw new Error('网表字段为空或包含换行');
+    return text;
+  };
+  const blocks = ['PROTEL NETLIST 2.0'];
+  const pins = new Map<string, string[]>();
+  for (const c of report.components ?? []) {
+    blocks.push(['[', 'DESIGNATOR', safe(c.designator), 'FOOTPRINT', safe(c.footprint?.name || 'UNKNOWN'),
+      'PARTTYPE', safe(c.name || 'UNKNOWN'), '*', ']'].join('\n'));
+    for (const p of c.pins ?? []) if (p.net) {
+      const net = safe(p.net), list = pins.get(net) ?? [];
+      list.push(safe(c.designator) + '-' + safe(p.pin)); pins.set(net, list);
     }
-    blocks.push('[' + lines.join('\n') + ']');
   }
-  return blocks.join('\n\n');
+  for (const [net, list] of pins) blocks.push(['(', net, ...list, ')'].join('\n'));
+  const result = blocks.join('\n'); protel2Signature(result); return result;
 }
 
 export async function schGenerateFromPcb(bridge: BridgeClient, params: { type?: string }): Promise<any> {
-  const report: any = await netlistReport(bridge);
-  const protel2 = netlistToProtel2(report);
-  const imp = await schGenerateFromNetlist(bridge, { netlist: protel2, type: params.type ?? 'Protel2' });
-  return { ...imp, source: 'pcb_netlist_report', protel2Netlist: protel2 };
+  const type = params.type ?? 'Protel2';
+  if (!(NETLIST_TYPES as readonly string[]).includes(type)) throw new Error('不支持的网表类型: ' + type);
+  const source: any = await bridge.executeRaw(
+    'const board = await eda.dmt_Board.getCurrentBoardInfo();' +
+    'const pcb = await eda.dmt_Pcb.getCurrentPcbInfo();' +
+    'if (!pcb || board?.pcb?.uuid !== pcb.uuid || !board?.schematic?.uuid) throw new Error("请打开有关联原理图的 PCB");' +
+    'const pages = (await eda.dmt_Schematic.getAllSchematicPagesInfo()).filter(p => p.parentSchematicUuid === board.schematic.uuid);' +
+    'if (!pages.length) throw new Error("关联原理图没有可打开的页面");' +
+    'return { pcbUuid: pcb.uuid, pageUuid: pages[0].uuid, netlist: await eda.pcb_Net.getNetlist(' + JSON.stringify(type) + ') };');
+  if (type === 'Protel2') protel2Signature(source.netlist);
+  await bridge.executeRaw('const tab = await eda.dmt_EditorControl.openDocument(' + JSON.stringify(source.pageUuid) + '); if (!tab) throw new Error("打开目标原理图失败"); return tab;');
+  try {
+    return { ...await schGenerateFromNetlist(bridge, { netlist: source.netlist, type }), source: 'pcb_official_netlist', pcbUuid: source.pcbUuid };
+  } finally {
+    await bridge.executeRaw('return await eda.dmt_EditorControl.openDocument(' + JSON.stringify(source.pcbUuid) + ');');
+  }
 }
 
 // ─── 16. eprj3 工程检查器 ────────────────────────────────────────────
 const EPRJ3_EXTS = ['.eprj3', '.esch2', '.epcb2', '.epan2', '.ecfg', '.evar'];
 
 export async function eprj3ProjectInfo(projectPath: string): Promise<any> {
-  const p = String(projectPath || '').trim();
-  if (!p) throw new Error('projectPath 不能为空');
-  if (!existsSync(p)) throw new Error('路径不存在: ' + p);
-
-  const stat = statSync(p);
-  if (stat.isFile()) {
-    const ext = path.extname(p).toLowerCase();
-    if (!EPRJ3_EXTS.includes(ext)) throw new Error('不是 eprj3 工程文件: ' + ext);
-    const raw = readFileSync(p, 'utf8');
-    if (ext === '.eprj3') {
-      let json: any;
-      try { json = JSON.parse(raw); } catch { json = null; }
-      return { kind: 'project-index', file: path.basename(p), sizeBytes: raw.length, keys: json ? Object.keys(json) : [], json };
+  const p=String(projectPath??'').trim();
+  if(!p||!existsSync(p))throw new Error('路径不存在: '+p);
+  if(statSync(p).isFile()){
+    const ext=path.extname(p).toLowerCase();
+    if(!EPRJ3_EXTS.includes(ext))throw new Error('不支持的工程文件扩展名: '+ext);
+    const bytes=readFileSync(p);
+    if(bytes.subarray(0,2).toString()==='PK'||bytes.subarray(0,6).toString()==='SQLite')
+      throw new Error('该文件是二进制工程容器，请先用 EDA 导出/解包为文本源文件后检查');
+    const raw=bytes.toString('utf8').replace(/^\uFEFF/,'');
+    if(ext==='.eprj3'){
+      try {const json=JSON.parse(raw);return {kind:'project-index',file:path.basename(p),sizeBytes:bytes.length,keys:Object.keys(json),json};}catch{}
     }
-    // JSON-lines 记录文件（.esch2/.epcb2/.epan2/.ecfg/.evar）
-    const records = raw.split('\n').map((l) => l.trim()).filter(Boolean);
-    const byType = new Map<string, number>();
-    let meta: any = null;
-    let parsed = 0;
-    for (const line of records) {
-      try {
-        const obj = JSON.parse(line);
-        if (obj && typeof obj.type === 'string') {
-          byType.set(obj.type, (byType.get(obj.type) || 0) + 1);
-          if (obj.type === 'META' && meta === null) meta = obj;
-        }
-        parsed += 1;
-      } catch { /* 跳过非 JSON 行 */ }
-    }
-    return {
-      kind: 'source-records',
-      file: path.basename(p),
-      recordCount: records.length,
-      parsedRecords: parsed,
-      recordTypes: Object.fromEntries(byType),
-      meta,
-    };
+    const parsed=parseSourceRecords(raw),counts:Record<string,number>={};
+    for(const r of parsed.records)counts[r.header.type]=(counts[r.header.type]??0)+1;
+    const meta=parsed.records.find(r=>r.header.type==='META')?.data??parsed.records.find(r=>r.header.type==='DOCHEAD')?.data??null;
+    if(!parsed.records.length&&parsed.errors.length)throw new Error('源文件无法解析：'+parsed.errors[0].message);
+    return {kind:'source-records',file:path.basename(p),recordCount:parsed.recordCount,parsedRecords:parsed.records.length,
+      recordTypes:counts,meta,parseErrors:parsed.errors,complete:parsed.errors.length===0};
   }
-
-  // 目录：工程根
-  const entries = readdirSync(p);
-  const eprj3File = entries.find((f) => f.toLowerCase().endsWith('.eprj3'));
-  let index: any = null;
-  if (eprj3File) {
-    try { index = JSON.parse(readFileSync(path.join(p, eprj3File), 'utf8')); } catch { index = null; }
-  }
-  const collect = (dir: string, ext: string): string[] => {
-    const abs = path.join(p, dir);
-    if (!existsSync(abs) || !statSync(abs).isDirectory()) return [];
-    const results: string[] = [];
-    const walkDir = (d: string) => {
-      for (const f of readdirSync(d)) {
-        const full = path.join(d, f);
-        if (statSync(full).isDirectory()) walkDir(full);
-        else if (f.toLowerCase().endsWith(ext)) results.push(path.relative(p, full));
-      }
-    };
-    walkDir(abs);
-    return results;
-  };
-  const schematics = collect('sch', '.esch2');
-  const pcbs = collect('pcb', '.epcb2');
-  const panels = collect('panel', '.epan2');
-  const schematicNames = readdirSync(path.join(p, 'sch')).filter((f) => statSync(path.join(p, 'sch', f)).isDirectory()).filter(() => true).slice(0, 50);
-  return {
-    kind: 'project-folder',
-    projectName: eprj3File ? eprj3File.replace(/\.eprj3$/i, '') : '(未找到 .eprj3)',
-    eprj3File: eprj3File || null,
-    indexKeys: index ? Object.keys(index) : [],
-    schematicFolders: schematicNames,
-    schematicSheets: schematics,
-    pcbFiles: pcbs,
-    panelFiles: panels,
-  };
+  const files:string[]=[];
+  const walk=(d:string)=>{for(const f of readdirSync(d)){const full=path.join(d,f);const s=statSync(full);if(s.isDirectory())walk(full);else files.push(path.relative(p,full));}};
+  walk(p);
+  const index=files.find(f=>f.toLowerCase().endsWith('.eprj3'))??null;
+  const indexInfo=index?await eprj3ProjectInfo(path.join(p,index)):null;
+  const schematicSheets=files.filter(f=>f.toLowerCase().endsWith('.esch2'));
+  return {kind:'project-folder',projectName:index?path.basename(index,'.eprj3'):path.basename(p),eprj3File:index,
+    indexKeys:indexInfo?.keys??[],indexInfo,schematicFolders:[...new Set(schematicSheets.map(f=>path.dirname(f)))],
+    schematicSheets,pcbFiles:files.filter(f=>f.toLowerCase().endsWith('.epcb2')),panelFiles:files.filter(f=>f.toLowerCase().endsWith('.epan2'))};
 }
 
 // ─── MCP 注册 ────────────────────────────────────────────────────────
 export function registerProTools(server: any, bridge: BridgeClient) {
-  server.tool('pcb_bom_export', '导出 PCB BOM（按元件名聚合：数量、位号、网络、LCSC 料号），返回 JSON + CSV', {
+  server.tool('pcb_bom_export', '导出 PCB BOM（按型号、封装和料号聚合），返回 JSON + CSV', {
     lcscCodes: z.record(z.string()).optional().describe('元件名 → LCSC 料号映射（如 {"R-10k":"C25744"}，LCSC API 受保护无法自动查询）'),
   }, async ({ lcscCodes }: { lcscCodes?: Record<string, string> }) => {
     const data = await exportBom(bridge, { lcscCodes });
@@ -726,31 +575,35 @@ export function registerProTools(server: any, bridge: BridgeClient) {
   server.tool('pcb_net_connectivity_check', '检查所有网络的连通性（焊盘数/走线段数，标记未布线网络）', {
     nets: z.array(z.string()).optional().describe('指定检查的网络（默认全部）'),
   }, async ({ nets }: { nets?: string[] }) => {
-    const data = await checkConnectivity(bridge);
+    const data = await checkConnectivity(bridge, { nets });
     return { content: [{ type: 'text' as const, text: JSON.stringify(data, null, 2) }] };
   });
 
-  server.tool('pcb_current_density_report', '各网络载流能力估算（IPC-2221，线宽总和 → 电流容量），标记偏低网络', {}, async () => {
+  server.tool('pcb_current_density_report', '各网络载流能力估算（IPC-2221，最弱走线段，默认 1oz/10°C 温升），标记偏低网络', {}, async () => {
     const data = await currentDensityReport(bridge);
     return { content: [{ type: 'text' as const, text: JSON.stringify(data, null, 2) }] };
   });
 
-  server.tool('pcb_fanout_component', '为指定元件的所有焊盘创建扇出过孔（同一网络）', {
+  server.tool('pcb_fanout_component', '在指定元件的带网络焊盘中心创建通孔；当前为盘中过孔模式，需工艺支持', {
     designator: z.string().describe('元件位号，如 U1'),
-  }, async ({ designator }: { designator: string }) => {
-    const data = await fanoutComponent(bridge, { designator });
+    viaDrill: z.number().positive().optional().describe('过孔孔径 mil（默认 12，按工程规则调整）'),
+    viaDiameter: z.number().positive().optional().describe('过孔外径 mil（默认 22，按工程规则调整）'),
+  }, async ({ designator, viaDrill, viaDiameter }: { designator: string } & ViaOptions) => {
+    const data = await fanoutComponent(bridge, { designator, viaDrill, viaDiameter });
     return { content: [{ type: 'text' as const, text: JSON.stringify(data, null, 2) }] };
   });
 
-  server.tool('pcb_auto_route_nets', '自动布线：单层障碍规避（默认，绕开焊盘+clearance）或两层 L 型（useVias）。需 DRC 复查', {
+  server.tool('pcb_auto_route_nets', '自动布线：保守的正交连接草稿，检查铜障碍和端点，失败不强连；useVias 在焊盘处换层，返回 DRC 结果', {
     nets: z.array(z.string()).optional().describe('要布线的网络列表（默认全部）'),
     topLayer: z.number().optional().describe('布线层（默认 1 顶层）'),
-    viaLayer: z.number().optional().describe('垂直走线层（useVias 时，默认 2 底层）'),
+    viaLayer: z.number().optional().describe('换层后的布线层（useVias 时，默认 2 底层）'),
     width: z.number().optional().describe('线宽 mil（默认 10）'),
     clearance: z.number().optional().describe('障碍间距 mil（默认 15）'),
-    useVias: z.boolean().optional().describe('true=两层 L 型（含过孔）；false/缺省=单层障碍规避'),
-  }, async ({ nets, topLayer, viaLayer, width, clearance, useVias }: { nets?: string[]; topLayer?: number; viaLayer?: number; width?: number; clearance?: number; useVias?: boolean }) => {
-    const data = await autoRouteNets(bridge, { nets, topLayer, viaLayer, width, clearance, useVias });
+    useVias: z.boolean().optional().describe('true=焊盘中心放置过孔并在 viaLayer 布线（需支持盘中过孔）；false=单层'),
+    viaDrill: z.number().positive().optional().describe('换层过孔孔径 mil（默认 12，按工程规则调整）'),
+    viaDiameter: z.number().positive().optional().describe('换层过孔外径 mil（默认 22，按工程规则调整）'),
+  }, async ({ nets, topLayer, viaLayer, width, clearance, useVias, viaDrill, viaDiameter }: { nets?: string[]; topLayer?: number; viaLayer?: number; width?: number; clearance?: number; useVias?: boolean } & ViaOptions) => {
+    const data = await autoRouteNets(bridge, { nets, topLayer, viaLayer, width, clearance, useVias, viaDrill, viaDiameter });
     return { content: [{ type: 'text' as const, text: JSON.stringify(data, null, 2) }] };
   });
 
@@ -765,7 +618,7 @@ export function registerProTools(server: any, bridge: BridgeClient) {
     return { content: [{ type: 'text' as const, text: JSON.stringify(data, null, 2) }] };
   });
 
-  server.tool('pcb_route_differential_pairs', '差分对自动布线：正/负网络平行 L 型走线（负网络偏移 gap），报告等长偏差', {
+  server.tool('pcb_route_differential_pairs', '差分对双网连接草稿：保留焊盘端点并报告真实长度；不保证恒定耦合间距或等长', {
     pairName: z.string().optional().describe('指定差分对名称（默认全部）'),
     layer: z.number().optional().describe('走线层（默认 1 顶层）'),
     width: z.number().optional().describe('线宽 mil（默认 6）'),
@@ -784,7 +637,7 @@ export function registerProTools(server: any, bridge: BridgeClient) {
     const data = await autoFanoutAndRoute(bridge);
     return { content: [{ type: 'text' as const, text: JSON.stringify(data, null, 2) }] };
   });
-  server.tool('pcb_auto_place_components', '自动布局：把元件移动到其焊盘质心（一阶优化），锁定元件跳过', {
+  server.tool('pcb_auto_place_components', '封装质心对齐：把元件原点移动到自身焊盘质心；不提供按网络优化布局，锁定元件跳过', {
     maxMoves: z.number().optional().describe('最大移动数（默认 100）'),
   }, async ({ maxMoves }: { maxMoves?: number }) => {
     const data = await autoPlaceComponents(bridge, { maxMoves });
@@ -805,22 +658,22 @@ export function registerProTools(server: any, bridge: BridgeClient) {
     const data = await designDiff(bridge);
     return { content: [{ type: 'text' as const, text: JSON.stringify(data, null, 2) }] };
   });
-  server.tool('sch_generate_from_netlist', '通过官方 sch_Netlist.setNetlist 将网表导入原理图（生成原理图）。类型: EasyEDA/JLCEDA/Protel2/PADS/Allegro/DISA/DSNET', {
-    netlist: z.string().describe('网表内容（Protel2 示例: [GND\nU1-1\nR1-2\n]）'),
+  server.tool('sch_generate_from_netlist', '更新当前原理图网表并读取验证结果；不能保证自动生成符号、导线或布局', {
+    netlist: z.string().describe('完整网表文件内容；Protel2 需文件头、元件属性和圆括号网络记录'),
     type: z.string().optional().describe('网表格式（默认 Protel2）'),
   }, async ({ netlist, type }: { netlist: string; type?: string }) => {
     const data = await schGenerateFromNetlist(bridge, { netlist, type });
     return { content: [{ type: 'text' as const, text: JSON.stringify(data, null, 2) }] };
   });
 
-  server.tool('sch_generate_from_pcb', '一键：读取当前 PCB 网表报告 → 转 Protel2 网表 → 导入原理图生成', {
+  server.tool('sch_generate_from_pcb', '导出当前 PCB 官方网表，更新关联原理图并读取验证；失败明确报错，不保证自动画图', {
     type: z.string().optional().describe('网表格式（默认 Protel2）'),
   }, async ({ type }: { type?: string }) => {
     const data = await schGenerateFromPcb(bridge, { type });
     return { content: [{ type: 'text' as const, text: JSON.stringify(data, null, 2) }] };
   });
 
-  server.tool('pcb_eprj3_project_info', '检查嘉立创EDA专业版 .eprj3 工程（目录或文件）：工程索引、原理图/PCB/面板文件清单，或源文件记录统计（JSON-lines）', {
+  server.tool('pcb_eprj3_project_info', '检查嘉立创EDA专业版 .eprj3 工程（目录或文件）：工程索引、原理图/PCB/面板文件清单，或源文件记录统计（支持原生 header||payload| 记录）', {
     projectPath: z.string().describe('.eprj3 工程根目录路径，或 .eprj3/.epcb2/.esch2 等文件路径'),
   }, async ({ projectPath }: { projectPath: string }) => {
     const data = await eprj3ProjectInfo(projectPath);

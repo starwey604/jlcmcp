@@ -21,8 +21,8 @@ async function ensureBridge() {
     try {
       const res = await fetch('http://127.0.0.1:' + port + '/health', { signal: AbortSignal.timeout(300) });
       const j = await res.json();
-      if (j.service === 'easyeda-bridge') return port;
-    } catch { /* next */ }
+      if (j.service === 'easyeda-bridge') throw new Error('EXISTING_BRIDGE: 请在隔离网络中运行测试，避免操作真实 EDA');
+    } catch (e) { if (e.message.startsWith('EXISTING_BRIDGE:')) throw e; }
   }
   const child = spawn(process.execPath, [path.join(ROOT, 'scripts/bridge-server.mjs')], { stdio: ['ignore', 'pipe', 'pipe'] });
   child.stderr?.on('data', (d) => process.stderr.write('[bridge] ' + d));
@@ -53,14 +53,22 @@ function compRow(designator) {
     getState_X: () => c.x,
     getState_Y: () => c.y,
     getState_Rotation: () => c.rotation,
-    getState_Width: () => 100,
-    getState_Height: () => 50,
+    getState_PrimitiveType: () => 'Component',
+    getState_Component: () => ({ name: 'R-10k' }),
     getState_Layer: () => 1,
     getState_PrimitiveLock: () => false,
-    getState_Pads: () => [{ net: 'GND' }, { net: 'VCC' }],
+    getState_Pads: () => padDefs.filter(p => p[4] === designator).map(p => ({ primitiveId: p[0], net: p[1], padNumber: String(p[5]) })),
   };
 }
 
+const padDefs = [
+  ['pad1', 'GND', 10, 20, 'U1', 5], ['pad2', 'VCC', 100, 200, 'U1', 1],
+  ['pad3', 'VCC', 500, 600, 'R1', 1], ['pad4', 'SDA', 900, 300, 'R1', 2],
+  ['pad5', 'SDA', 1200, 700, 'U1', 2], ['pad6', 'USB_DP', 300, 400, 'U1', 3],
+  ['pad7', 'USB_DP', 700, 900, 'R1', 3], ['pad8', 'USB_DN', 400, 500, 'U1', 4],
+  ['pad9', 'USB_DN', 800, 1000, 'R1', 4],
+];
+let selected = [], trackCounter = 0;
 const fakeEda = {
   pcb_PrimitiveComponent: {
     getAll: async () => [compRow('U1'), compRow('R1')],
@@ -72,37 +80,35 @@ const fakeEda = {
         if (props.rotation !== undefined) c.rotation = props.rotation;
       }
       (fakeEda.__modifyLog ||= []).push({ id, props });
+      return c ? compRow(c.designator) : undefined;
     },
+    delete: async (ids) => { fakeEda.__deleted = ids; return true; },
     create: async (c, layer, x, y, rotation, lock) => { mockComps.push({ id: 'prim-NEW1', designator: 'NEW1', x, y, rotation: rotation ?? 0 }); return compRow('NEW1'); },
   },
   pcb_Net: {
     getAllNetsName: async () => ['GND', 'VCC', 'SDA'],
     getNetLength: async (n) => (n === 'GND' ? 123.4 : 56.7),
+    getNetlist: async () => fakeEda.__setNetlist.netlist,
   },
   pcb_PrimitiveLine: {
-    getAll: async (net, layer) => [{
+    getAll: async (net, layer) => layer === 11 || (net && net !== 'GND') ? [] : [{
       getState_PrimitiveId: () => 't1',
       getState_Net: () => net || 'GND',
       getState_Layer: () => layer ?? 1,
       getState_StartX: () => 0, getState_StartY: () => 0,
       getState_EndX: () => 100, getState_EndY: () => 100,
-      getState_Width: () => 10,
+      getState_LineWidth: () => 10,
     }],
-    create: async () => true,
+    create: async () => ({ getState_PrimitiveId: () => "track-" + (++trackCounter) }),
     delete: async () => true,
   },
   pcb_PrimitivePad: {
-    getAll: async () => [
-      { getState_PrimitiveId: () => 'pad1', getState_Net: () => 'GND', getState_X: () => 10, getState_Y: () => 20, getState_Designator: () => 'U1', getState_PrimitiveLock: () => false, getState_Diameter: () => 30, getState_Shape: () => 'round' },
-      { getState_PrimitiveId: () => 'pad2', getState_Net: () => 'VCC', getState_X: () => 100, getState_Y: () => 200, getState_Designator: () => 'U1', getState_PrimitiveLock: () => false, getState_Diameter: () => 30, getState_Shape: () => 'round' },
-      { getState_PrimitiveId: () => 'pad3', getState_Net: () => 'VCC', getState_X: () => 500, getState_Y: () => 600, getState_Designator: () => 'R1', getState_PrimitiveLock: () => false, getState_Diameter: () => 30, getState_Shape: () => 'round' },
-      { getState_PrimitiveId: () => 'pad4', getState_Net: () => 'SDA', getState_X: () => 900, getState_Y: () => 300, getState_Designator: () => 'R1', getState_PrimitiveLock: () => false, getState_Diameter: () => 30, getState_Shape: () => 'round' },
-      { getState_PrimitiveId: () => 'pad5', getState_Net: () => 'SDA', getState_X: () => 1200, getState_Y: () => 700, getState_Designator: () => 'U1', getState_PrimitiveLock: () => false, getState_Diameter: () => 30, getState_Shape: () => 'round' },
-      { getState_PrimitiveId: () => 'pad6', getState_Net: () => 'USB_DP', getState_X: () => 300, getState_Y: () => 400, getState_Designator: () => 'U1', getState_PrimitiveLock: () => false, getState_Diameter: () => 30, getState_Shape: () => 'round' },
-      { getState_PrimitiveId: () => 'pad7', getState_Net: () => 'USB_DP', getState_X: () => 700, getState_Y: () => 900, getState_Designator: () => 'R1', getState_PrimitiveLock: () => false, getState_Diameter: () => 30, getState_Shape: () => 'round' },
-      { getState_PrimitiveId: () => 'pad8', getState_Net: () => 'USB_DN', getState_X: () => 320, getState_Y: () => 420, getState_Designator: () => 'U1', getState_PrimitiveLock: () => false, getState_Diameter: () => 30, getState_Shape: () => 'round' },
-      { getState_PrimitiveId: () => 'pad9', getState_Net: () => 'USB_DN', getState_X: () => 720, getState_Y: () => 920, getState_Designator: () => 'R1', getState_PrimitiveLock: () => false, getState_Diameter: () => 30, getState_Shape: () => 'round' },
-    ],
+    getAll: async () => padDefs.map(([id, net, x, y, des, pin]) => ({
+      getState_PrimitiveId: () => 'prim-' + des + id,
+      getState_Net: () => net, getState_X: () => x, getState_Y: () => y,
+      getState_PadNumber: () => String(pin), getState_Layer: () => 1,
+      getState_Pad: () => ['ELLIPSE', 30, 30], getState_PrimitiveLock: () => false,
+    })),
   },
   pcb_PrimitiveVia: {
     getAll: async () => [],
@@ -114,8 +120,9 @@ const fakeEda = {
     modify: async () => true,
   },
   pcb_Primitive: {
-    getPrimitivesBBox: async () => ({ minX: 0, minY: 0, maxX: 100, maxY: 100 }),
+    getPrimitivesBBox: async ([row]) => { const x=row.getState_X?.()??0,y=row.getState_Y?.()??0,r=row.getState_PrimitiveType?.()==='Component'?50:15; return {minX:x-r,minY:y-r,maxX:x+r,maxY:y+r}; },
   },
+  pcb_Layer: { getAllLayers: async () => [{ id:1, type:'SIGNAL', layerStatus:1 },{ id:2, type:'SIGNAL', layerStatus:1 }] },
   pcb_MathPolygon: {
     createPolygon: async (s) => s,
     createComplexPolygon: async (s) => s,
@@ -139,7 +146,7 @@ const fakeEda = {
     getAllEqualLengthNetGroups: async () => [{ name: 'DATA', nets: ['D0', 'D1'] }],
   },
   dmt_Board: {
-    getCurrentBoardInfo: async () => ({ name: 'TEST', pcbUuid: 'pcb-u1', schematicUuid: 'sch-u1' }),
+    getCurrentBoardInfo: async () => ({ name: 'TEST', pcb: {uuid:'pcb-u1'}, schematic: {uuid:'sch-u1'} }),
   },
   dmt_EditorControl: {
     openDocument: async (uuid) => 'tab-' + uuid,
@@ -154,15 +161,18 @@ const fakeEda = {
     exportImage: async () => 'data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mP8z8BQDwAEhQGAhKmMIQAAAABJRU5ErkJggg==',
   },
   pcb_SelectControl: {
-    selectByDesignator: async () => true,
-    deleteSelected: async () => true,
+    clearSelected: async () => { selected=[]; return true; },
+    doSelectPrimitives: async (ids) => { selected=ids; return true; },
+    getAllSelectedPrimitives: async () => mockComps.filter(c=>selected.includes(c.id)).map(c=>compRow(c.designator)),
     getAllSelectedPrimitives_PrimitiveId: async () => [],
   },
+  dmt_Pcb: { getCurrentPcbInfo: async () => ({ uuid:'pcb-u1' }) },
+  dmt_Schematic: { getCurrentSchematicPageInfo: async () => ({ uuid:'page-u1' }), getAllSchematicPagesInfo: async () => [{ uuid:'page-u1',parentSchematicUuid:'sch-u1' }] },
   sch_PrimitiveComponent: { getAll: async () => [] },
   sch_PrimitivePin: { getAll: async () => [] },
   sch_PrimitiveWire: { getAll: async () => [] },
   sch_Netlist: {
-    getNetlist: async () => '(mock netlist)',
+    getNetlist: async () => fakeEda.__setNetlist?.netlist ?? 'PROTEL NETLIST 2.0\n[\nDESIGNATOR\nU1\n*\n]',
     setNetlist: async (type, netlist) => { fakeEda.__setNetlist = { type, netlist }; return undefined; },
   },
   sch_Drc: { check: async () => true },
@@ -171,7 +181,8 @@ const fakeEda = {
 
 async function connectMockEda(port) {
   const ws = new WebSocket('ws://127.0.0.1:' + port + '/eda');
-  await new Promise((res, rej) => { ws.on('open', res); ws.on('error', rej); });
+  // The server can send its handshake in the same turn as open. Install the
+  // message handler first, otherwise a fast local connection may lose it.
   ws.on('message', async (raw) => {
     const msg = JSON.parse(raw.toString());
     if (msg.type === 'handshake') {
@@ -189,6 +200,7 @@ async function connectMockEda(port) {
       }
     }
   });
+  await new Promise((res, rej) => { ws.once('open', res); ws.once('error', rej); });
   return ws;
 }
 
@@ -196,8 +208,13 @@ async function connectMockEda(port) {
 const port = await ensureBridge();
 console.log('✔ Bridge Server @', port);
 const mockWs = await connectMockEda(port);
-await new Promise((r) => setTimeout(r, 300));
-const health = await (await fetch('http://127.0.0.1:' + port + '/health')).json();
+let health;
+for (let i = 0; i < 50; i++) {
+  health = await (await fetch('http://127.0.0.1:' + port + '/health')).json();
+  if (health.activeWindowId === 'mock-win-1') break;
+  await new Promise(r => setTimeout(r, 100));
+}
+if (health.activeWindowId !== 'mock-win-1') throw new Error('Mock EDA did not register within 5 seconds');
 console.log('✔ health.edaConnected =', health.edaConnected, '| windows =', health.edaWindowCount);
 
 // 从 dist 导入 codegen（需先 npm run build）
@@ -282,6 +299,20 @@ assert(moveCall?.props?.rotation === 90, 'move_component modified rotation=90');
 const pro = await import(pathToFileURL(path.join(ROOT, 'dist/tools/pro.js')).href);
 const realBridge = new BridgeClient({ baseUrl: 'http://127.0.0.1:' + port });
 
+// 回归：选择窗口时响应字段曾引用未定义变量，导致重复发送响应头并退出服务。
+const selectedWindow = await realBridge.selectWindow('mock-win-1');
+assert(selectedWindow.success && selectedWindow.activeWindowId === 'mock-win-1', 'selectWindow: 返回选中的窗口');
+assert((await realBridge.health()).activeWindowId === 'mock-win-1', 'selectWindow: 健康检查仍可用');
+assert((await realBridge.command('ping')).message === 'pong', 'selectWindow: 选择后仍可执行代码');
+let missingWindowRejected = false;
+try {
+  await realBridge.selectWindow('missing-window');
+} catch (e) {
+  missingWindowRejected = e.message.includes('not found');
+}
+assert(missingWindowRejected, 'selectWindow: 拒绝不存在的窗口');
+assert((await realBridge.health()).activeWindowId === 'mock-win-1', 'selectWindow: 失败后保留活动窗口且服务存活');
+
 const bom = await pro.exportBom(realBridge);
 assert(bom.itemCount === 1, 'BOM: 1 类元件（R-10k x2）');
 assert(bom.items[0].quantity === 2, 'BOM: R-10k 数量 2');
@@ -350,7 +381,7 @@ assert(bomLCSC.items[0].lcscCode === 'C25744', 'bom_lcsc: 料号映射生效');
 
 // ─── 7. 高级功能 v4（网表→原理图 / eprj3）───────────────────────────
 const p2 = pro.netlistToProtel2(await pro.netlistReport(realBridge));
-assert(p2.includes('[VCC') && p2.includes('U1-1'), 'protel2: VCC 网络含引脚');
+assert(p2.includes('(\nVCC') && p2.includes('U1-1'), 'protel2: VCC 网络含引脚');
 
 const gen = await pro.schGenerateFromNetlist(realBridge, { netlist: p2, type: 'Protel2' });
 assert(gen.ok === true, 'sch_gen: setNetlist 调用成功');

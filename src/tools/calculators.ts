@@ -9,13 +9,13 @@ import {
 export function registerCalculatorTools(server: any) {
   server.tool(
     'calc_impedance',
-    '计算 PCB 走线阻抗，或根据目标阻抗反算线宽。支持微带线/带状线/差分模式',
+    '使用对数近似公式估算阻抗/反算线宽，支持微带线和中心带状线及差分模式；超出公式范围时报错，非场求解器',
     {
       type: z.enum(['microstrip', 'stripline', 'diff_microstrip', 'diff_stripline']).describe('走线类型'),
       width: z.number().optional().describe('线宽 (mil)，与 targetImpedance 二选一'),
       targetImpedance: z.number().optional().describe('目标阻抗 (Ω)，填此项则反算线宽'),
       thickness: z.number().optional().describe('铜厚 (mil)，默认 1.4 (1oz)'),
-      height: z.number().describe('介质厚度 (mil)'),
+      height: z.number().describe('mil；微带线为走线到参考平面距离，中心带状线为上下两参考平面之间的总间距'),
       er: z.number().optional().describe('介电常数，默认 4.3 (FR4)'),
       spacing: z.number().optional().describe('差分间距 (mil)，差分模式必填'),
     },
@@ -49,6 +49,7 @@ export function registerCalculatorTools(server: any) {
                 actualImpedance: result.impedance,
                 error: result.error,
                 unit: 'mil / Ω',
+                note: '近似估算；制造前请用板厂叠层及阻抗场求解结果复核。',
               }, null, 2),
             }],
           };
@@ -79,6 +80,7 @@ export function registerCalculatorTools(server: any) {
               type: result.type,
               unit: 'Ω',
               params: result.params,
+              note: '近似估算；差分模型不包含阻焊、铜粗糙度等影响。',
             }, null, 2),
           }],
         };
