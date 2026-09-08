@@ -45,6 +45,9 @@ const fns = extractFunctions(source);
 for (const [name, fn] of extractFunctions(fs.readFileSync(path.join(ROOT, 'src/routing-geometry.ts'), 'utf8'))) {
   fns.set(name, fn);
 }
+for (const [name, fn] of extractFunctions(fs.readFileSync(path.join(ROOT, 'src/routing-endpoints.ts'), 'utf8'))) {
+  fns.set(name, fn);
+}
 // 当前官方 API 的维护入口；覆盖归档插件中同名处理器，生成步骤不会丢失修复。
 for (const [name, fn] of extractFunctions(fs.readFileSync(path.join(ROOT, 'src/codegen/handlers.ts'), 'utf8'))) {
   fns.set(name, fn);
@@ -96,6 +99,7 @@ const DISPATCH = {
   move_component: 'moveComponent',
   route_track: 'routeTrack',
   check_route_geometry: 'checkRouteGeometry',
+  check_route_endpoints: 'checkRouteEndpoints',
   create_via: 'createVia',
   delete_via: 'deleteVia',
   get_tracks: 'getTracks',

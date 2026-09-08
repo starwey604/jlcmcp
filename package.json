@@ -10,7 +10,7 @@
     "port": "node scripts/port-plugin.mjs",
     "start:bridge": "node scripts/bridge-server.mjs",
     "test:bridge": "node scripts/smoke-bridge.mjs",
-    "test:regressions": "node --test scripts/test-regressions.mjs"
+    "test:regressions": "node --test scripts/test-regressions.mjs scripts/test-routing-endpoints.mjs"
   },
   "dependencies": {
     "@anthropic-ai/sdk": "^0.39.0",

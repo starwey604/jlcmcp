@@ -402,6 +402,9 @@ export async function autoRouteNets(bridge: BridgeClient, params: AutoRouteParam
   if (params.dryRun) return {dryRun:true,plannedNets:summary.filter(r=>r.paths).length,routedNets:0,generatedNets:0,
     totalTrackSegments:0,totalVias:0,skippedNets:summary.filter(r=>r.skipped).length,nets:summary,routingOptions,
     note:'仅规划并检查保守障碍；没有创建图元、重建铺铜或运行 DRC。'};
+  let endpointAudit:any;
+  try {endpointAudit=await bridge.command('check_route_endpoints',{nets:targets});}
+  catch (e:any) {endpointAudit={passed:false,error:e.message,issues:[]};}
   let geometry:any;
   try {geometry=await bridge.command('check_route_geometry',{nets:targets,...routingOptions});}
   catch (e:any) {geometry={passed:false,error:e.message,issues:[]};}
@@ -411,14 +414,16 @@ export async function autoRouteNets(bridge: BridgeClient, params: AutoRouteParam
   const connectionIssues=(drc.issues??[]).filter((i:any)=>i.connectionError);
   for(const r of summary) {
     r.connected=!r.skipped&&(drc.detailsAvailable||drc.passed)&&!connectionIssues.some((i:any)=>!i.net||i.net===r.net);
+    r.endpointsPassed=!!endpointAudit && !endpointAudit.error && !(endpointAudit.unsupportedTargets??[]).length
+      && Array.isArray(endpointAudit.issues) && !endpointAudit.issues.some((i:any)=>!i.net || i.net===r.net);
     r.geometryPassed=!!geometry && !geometry.error && Array.isArray(geometry.issues)
       && !geometry.issues.some((i:any)=>i.severity==='error' && (!i.net || i.net===r.net));
   }
-  return {routedNets:summary.filter(r=>r.connected&&r.geometryPassed).length,generatedNets:summary.filter(r=>r.segments>0).length,
+  return {routedNets:summary.filter(r=>r.connected&&r.geometryPassed&&r.endpointsPassed).length,generatedNets:summary.filter(r=>r.segments>0).length,
     skippedNets:summary.filter(r=>r.skipped).length,totalTrackSegments,totalVias,totalDetours:summary.filter(r=>r.paths?.some((p:Point[])=>p.length>2)).length,
     mode:params.useVias?'two_layer_escape':'single_layer_obstacle_aware',viaSize:params.useVias?viaSize:null,drcPassed:drc.passed,drcError:drc.error??null,nets:summary,
-    routingOptions,geometry,geometryPassed:geometry?.passed===true,
-    note:'默认采用 45° 角度约束与倒角，整理后重新检查固定铜外框；无可行路线则跳过。双层模式在焊盘中心放通孔。routedNets 同时要求网络连接与角度检查通过；drcPassed 为整板 DRC。'};
+    routingOptions,geometry,geometryPassed:geometry?.passed===true,endpointAudit,endpointsPassed:endpointAudit?.passed===true,
+    note:'默认采用 45° 角度约束与倒角，整理后重新检查固定铜外框；无可行路线则跳过。双层模式在焊盘中心放通孔。routedNets 同时要求网络连接、角度和端点检查通过；drcPassed 为整板 DRC。'};
 }
 
 // ─── 13. PCB 网表报告 ───────────────────────────────────────────────

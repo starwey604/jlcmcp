@@ -12,7 +12,7 @@ const SYSTEM_PROMPT = `你是嘉立创 EDA PCB 设计专家。你可以通过工
 1. 先用 get_state 了解当前 PCB 状态
 2. 分析问题，制定方案
 3. 逐步执行操作
-4. 用 check_route_geometry 检查角度、短折线及转角，再用 run_drc 验证设计规则
+4. 用 check_route_geometry 检查角度、短折线及转角，用 check_route_endpoints 检查偏心和边缘搭接，再用 run_drc 验证设计规则
 5. 总结执行结果和建议
 
 ## USB 差分走线规范
@@ -58,7 +58,8 @@ const SYSTEM_PROMPT = `你是嘉立创 EDA PCB 设计专家。你可以通过工
 - 移动元件前先了解当前位置
 - 走线前确认网络名和焊盘位置
 - route_track 默认约束为水平/垂直/45°并整理直角，先用 dryRun 查看路径；不要通过任意角度直连来绕过失败
-- 保留端点与中间连接锚点；DRC 通过不代表角度及折线质量通过
+- 普通焊盘/过孔默认连接原生中心，已有走线连接中心线；可以用 start/end + 图元 ID 显式绑定。特殊入口显式用 free/preserve，不得为绕过预检而使用它们
+- 保留绑定后的端点与中间连接锚点；DRC 通过不代表端点、角度及折线质量通过
 - 批量操作时逐个执行，出错及时停止
 - 所有坐标单位为 mil
 
@@ -153,7 +154,7 @@ function buildToolRegistry(bridge: BridgeClient): AgentTool[] {
 
     // --- 走线 / 过孔 ---
     {
-      name: 'route_track', description: '按角度约束整理并画走线；保留端点，检查障碍，可 dryRun 预览',
+      name: 'route_track', description: '绑定焊盘/过孔中心或导线中心线，按角度约束整理并避障；可 dryRun 预览',
       input_schema: {
         type: 'object', properties: {
           net: { type: 'string', description: '网络名称' },
@@ -167,6 +168,10 @@ function buildToolRegistry(bridge: BridgeClient): AgentTool[] {
           minSegmentLength: { type: 'number', description: '短线段提示阈值 mil，默认 1' },
           maxDeviation: { type: 'number', description: '局部整理最大偏移 mil，默认 10' },
           angleToleranceDeg: { type: 'number', description: '角度检查容差，默认 0.01°，最大 1°' },
+          endpointMode: {type:'string',enum:['auto','preserve'],description:'默认 auto：只对接触同网铜的端点识别并连接中心；preserve 保留未显式绑定的坐标'},
+          start: {type:'object',properties:{kind:{type:'string',enum:['pad','via','track','free']},primitiveId:{type:'string'}},required:['kind'],description:'起点目标，除 free 外必须指定 primitiveId'},
+          end: {type:'object',properties:{kind:{type:'string',enum:['pad','via','track','free']},primitiveId:{type:'string'}},required:['kind'],description:'终点目标，除 free 外必须指定 primitiveId'},
+          maxEndpointExtension: {type:'number',description:'端点到锚点最大距离 mil，默认 100'},
           protectedIndices: { type: 'array', items: { type: 'integer' }, description: '必须保留的中间路径点下标' },
           dryRun: { type: 'boolean', description: 'true 只预览，不修改 PCB' },
         }, required: ['net', 'points', 'layer', 'width'],
@@ -184,6 +189,11 @@ function buildToolRegistry(bridge: BridgeClient): AgentTool[] {
         angleToleranceDeg:{type:'number',description:'角度容差（度）'},
       }},
       execute:async(p)=>bridge.command('check_route_geometry',p),
+    },
+    {
+      name:'check_route_endpoints',description:'只读检查焊盘/过孔偏心接入、线到线边缘搭接，不自动改线',
+      input_schema:{type:'object',properties:{nets:{type:'array',items:{type:'string'}},layer:{type:'integer'},toleranceMil:{type:'number',description:'中心线容差 0–1 mil，默认 0.1'}}},
+      execute:async(p)=>bridge.command('check_route_endpoints',p),
     },
     {
       name: 'create_via', description: '创建过孔',

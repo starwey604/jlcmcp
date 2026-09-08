@@ -85,7 +85,7 @@ pcb_move_component / pcb_relocate_component / pcb_batch_move / pcb_select_compon
 pcb_delete_selected / pcb_create_component
 
 ### 走线 / 过孔 (5)
-pcb_route_track / pcb_check_route_geometry / pcb_create_via / pcb_delete_tracks / pcb_delete_via
+pcb_route_track / pcb_check_route_geometry / pcb_check_route_endpoints / pcb_create_via / pcb_delete_tracks / pcb_delete_via
 
 默认角度约束、转角整理、预览参数及验证范围见 [走线路径约束与整理](docs/routing-geometry.md)。
 
@@ -172,7 +172,7 @@ pcb_eprj3_project_info — .eprj3 工程检查器（目录/文件：索引、原
 ```bash
 npm run build
 npm run test:bridge   # 80 项协议级检查（无需 EDA）
-npm run test:regressions # 25 项缺陷回归测试（无需 EDA）
+npm run test:regressions # 缺陷、端点和生成处理器回归测试（无需 EDA）
 ```
 
 冒烟测试发现已有 Bridge 时会退出，避免操作真实 EDA。Linux 上可以在隔离网络中测试，保持真实连接在线：

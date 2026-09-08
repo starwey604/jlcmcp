@@ -3,7 +3,8 @@
  */
 declare const eda: any;
 import { prepareRoutePath, inspectRoutePath, resolveRouteOptions, expandedBox,
-  type Point, type Box } from '../routing-geometry.js';
+  routePointDistance, type Point, type Box } from '../routing-geometry.js';
+import { resolveRouteEndpoints, validateEndpointOptions, inspectRouteEndpoints, type RouteTarget } from '../routing-endpoints.js';
 export {};
 
 function stateValue(row: any, key: string, fallback: any = undefined): any {
@@ -164,11 +165,12 @@ async function createVia(params: any): Promise<any> {
 }
 
 async function routeEnvironment(net: string, layer: number, width: number, clearance: number): Promise<any> {
-  const obstacles: Box[] = [], anchors: Box[] = [], unavailable: string[] = [];
+  const obstacles: Box[] = [], anchors: Box[] = [], unavailable: string[] = [], targets: RouteTarget[] = [];
   const { pads } = await getPads();
   for (const p of pads) {
     if (p.layer !== layer && p.layer !== 12) continue;
     if (!p.bbox) {unavailable.push(p.primitiveId);continue;}
+    targets.push({kind:'pad',primitiveId:p.primitiveId,net:p.net,layer:p.layer,x:p.x,y:p.y,rotation:p.rotation,shape:p.shape,bbox:p.bbox});
     if (p.net === net) anchors.push(p.bbox);
     else obstacles.push(expandedBox(p.bbox,clearance+width/2));
   }
@@ -182,6 +184,10 @@ async function routeEnvironment(net: string, layer: number, width: number, clear
       if (rowLayer !== layer && rowLayer !== 12) continue;
       const bbox=await primitiveBBox(row);
       if (!bbox) {unavailable.push(stateValue(row,'PrimitiveId',type));continue;}
+      if (type==='Via') targets.push({kind:'via',primitiveId:stateValue(row,'PrimitiveId'),net:stateValue(row,'Net',''),layer:12,
+        x:stateValue(row,'X'),y:stateValue(row,'Y'),diameter:stateValue(row,'Diameter'),bbox});
+      if (type==='Line') targets.push({kind:'track',primitiveId:stateValue(row,'PrimitiveId'),net:stateValue(row,'Net',''),layer:rowLayer,
+        start:{x:stateValue(row,'StartX'),y:stateValue(row,'StartY')},end:{x:stateValue(row,'EndX'),y:stateValue(row,'EndY')},width:stateValue(row,'LineWidth'),bbox});
       if (stateValue(row,'Net','') === net) anchors.push(bbox);
       else obstacles.push(expandedBox(bbox,clearance+width/2));
     }
@@ -193,7 +199,7 @@ async function routeEnvironment(net: string, layer: number, width: number, clear
   }
   const rawBounds=outlines.length ? await eda.pcb_Primitive.getPrimitivesBBox(outlines) : null;
   const bounds=rawBounds ? expandedBox(rawBounds,-clearance-width/2) : undefined;
-  return {obstacles,anchors,bounds,boardBoundsAvailable:!!bounds};
+  return {obstacles,anchors,targets,bounds,boardBoundsAvailable:!!bounds};
 }
 
 async function prepareTrack(params: any): Promise<any> {
@@ -203,17 +209,22 @@ async function prepareTrack(params: any): Promise<any> {
     throw new Error('网络、层号、线宽或间距无效');
   // Validate before any environment read, and keep original index semantics.
   prepareRoutePath(params.points,params);
+  validateEndpointOptions(params);
   const env=await routeEnvironment(params.net,params.layer,width,clearance);
+  const resolved=resolveRouteEndpoints(params.points,params.net,params.layer,width,env.targets,params);
   const protectedIndices=new Set<number>(params.protectedIndices ?? []);
-  params.points.forEach((p: Point,i: number)=>{
+  resolved.points.forEach((p: Point,i: number)=>{
     if (env.anchors.some((b: Box)=>p.x>=b.minX && p.x<=b.maxX && p.y>=b.minY && p.y<=b.maxY)) protectedIndices.add(i);
   });
-  const prepared=prepareRoutePath(params.points,{...params,protectedIndices:[...protectedIndices]},env.obstacles,env.bounds);
+  const prepared=prepareRoutePath(resolved.points,{...params,protectedIndices:[...protectedIndices]},env.obstacles,env.bounds);
+  prepared.issues.unshift(...resolved.issues);
+  prepared.ready=!prepared.issues.some(i=>i.severity==='error');
+  prepared.changed=prepared.changed || resolved.endpoints.some(e=>e.displacementMil>1e-7);
   if (!env.boardBoundsAvailable) prepared.issues.push({kind:'board_bounds_unavailable',severity:'warning',index:0,
     message:'没有可读取的板框外框；板边距离需由原生 DRC 核对'});
-  return {...prepared,net:params.net,layer:params.layer,width,clearance,
+  return {...prepared,endpoints:resolved.endpoints,endpointMode:params.endpointMode??'auto',net:params.net,layer:params.layer,width,clearance,
     boardBoundsAvailable:env.boardBoundsAvailable,obstacleModel:'conservative_fixed_copper_bboxes',
-    note:'保持连接锚点；间距使用指定的统一 clearance，板框按包围盒检查。铺铜将在写入后重建；此检查不替代原生 DRC。'};
+    note:'先解析焊盘/过孔中心或走线中心线，再按角度及障碍约束整理；端点移动受 maxEndpointExtension 限制，maxDeviation 相对端点修正后的路径。铺铜将在写入后重建；此检查不替代原生 DRC。'};
 }
 
 async function routeTrack(params: any): Promise<any> {
@@ -252,7 +263,10 @@ async function routeTrack(params: any): Promise<any> {
     // reported as successfully checked; use the whole-board audit after routing.
     geometryVerified=!missingPrimitiveIds.length && !postWriteIssues.some(i=>i.severity==='error' || i.kind==='pour_rebuild_failed');
   } catch (e: any) {postWriteIssues.push({kind:'readback_failed',message:e.message});}
-  return {...prepared,dryRun:false,createdSegments:ids.length,primitiveIds:ids,actualSegments,
+  const endpointsVerified=geometryVerified && prepared.endpoints.every((e:any)=>actualSegments.some((t:any)=>
+    routePointDistance(e.point,{x:t.startX,y:t.startY},{x:t.endX,y:t.endY})<=.001));
+  if (!endpointsVerified) postWriteIssues.push({kind:'endpoint_readback_unverified',severity:'warning',message:'未能在全部保留 ID 的实际导线上确认端点锚点；请运行端点检查及 DRC'});
+  return {...prepared,endpointsVerified,dryRun:false,createdSegments:ids.length,primitiveIds:ids,actualSegments,
     geometryVerified,missingPrimitiveIds,postWriteIssues,requiresDrc:true,
     verificationScope:'retained_created_segment_angles; use check_route_geometry for junctions and replaced IDs'};
 }
@@ -295,6 +309,21 @@ async function checkRouteGeometry(params: any = {}): Promise<any> {
     errors:issues.filter(i=>i.severity==='error').length,warnings:issues.filter(i=>i.severity==='warning').length,
     junctionsExcluded,anchorCorners,options,readOnly:true,
     note:'只检查线段角度、短线段及同层端点处的二度转角；焊盘/过孔锚点转角单独提示，多分支连接不当作普通拐角。'};
+}
+
+async function checkRouteEndpoints(params: any = {}): Promise<any> {
+  if (params.nets!==undefined && (!Array.isArray(params.nets) || params.nets.some((n:any)=>typeof n!=='string'))) throw Error('nets 必须是网络名称数组');
+  if (params.layer!==undefined && (!Number.isInteger(params.layer) || params.layer<=0)) throw Error('层号无效');
+  const selected=(net:string,layer:number)=>!!net && (!params.nets?.length || params.nets.includes(net))
+    && (params.layer===undefined || layer===12 || layer===params.layer);
+  const targets:RouteTarget[]=[];
+  for (const p of (await getPads()).pads) if(selected(p.net,p.layer)) targets.push({kind:'pad',primitiveId:p.primitiveId,
+    net:p.net,layer:p.layer,x:p.x,y:p.y,shape:p.shape,rotation:p.rotation,bbox:p.bbox});
+  for (const t of (await getTracks()).tracks) if(selected(t.net,t.layer)) targets.push({kind:'track',primitiveId:t.primitiveId,
+    net:t.net,layer:t.layer,start:{x:t.startX,y:t.startY},end:{x:t.endX,y:t.endY},width:t.width});
+  for (const v of await eda.pcb_PrimitiveVia.getAll()) if(selected(stateValue(v,'Net',''),12)) targets.push({kind:'via',primitiveId:stateValue(v,'PrimitiveId'),
+    net:stateValue(v,'Net'),layer:12,x:stateValue(v,'X'),y:stateValue(v,'Y'),diameter:stateValue(v,'Diameter')});
+  return inspectRouteEndpoints(targets,params.toleranceMil??.1);
 }
 
 async function relocateComponent(params: any): Promise<any> {
