@@ -52,7 +52,7 @@ export function registerGatewayTools(server: any, bridge: BridgeClient) {
 
   server.tool(
     'pcb_execute_code',
-    '在嘉立创EDA专业版内直接执行 JavaScript 代码（高级/调试用）。代码运行于扩展环境，eda 为官方扩展 API。示例：return await eda.dmt_Project.getCurrentProjectInfo();',
+    '在嘉立创EDA专业版内直接执行 JavaScript 代码（高级/调试用）。直接调用画线 API 会绕过 pcb_route_track 的角度约束、转角整理和障碍预检；常规布线请使用 pcb_route_track，原始代码布线后使用 pcb_check_route_geometry 和原生 DRC。示例：return await eda.dmt_Project.getCurrentProjectInfo();',
     {
       code: z.string().describe('要执行的 JavaScript 代码（支持 await，以 return 返回结果）'),
       windowId: z.string().optional().describe('目标 EDA 窗口 ID（可选，默认活动窗口）'),

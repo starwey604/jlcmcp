@@ -1,15 +1,35 @@
 import { z } from 'zod';
 import { BridgeClient } from '../bridge-client.js';
+import { routeShapeSchema } from './routing-schema.js';
+import type { Point, RouteOptions } from '../routing-geometry.js';
+
+type RouteTrackParams = RouteOptions & { net: string; points: Point[]; layer: number; width: number; clearance?: number; dryRun?: boolean };
 
 export function registerRoutingTools(server: any, bridge: BridgeClient) {
-  server.tool('pcb_route_track', '画走线', {
+  server.tool('pcb_route_track', '整理并绘制走线：默认水平/垂直/45°、直角倒角，保留连接锚点，写入前检查障碍；dryRun 可只预览', {
     net: z.string().describe('网络名称'),
-    points: z.array(z.object({ x: z.number(), y: z.number() })).describe('走线路径点 (mil)'),
+    points: z.array(z.object({ x: z.number(), y: z.number() })).min(2).max(4096).describe('走线路径点 (mil)，首尾坐标保持不变'),
     layer: z.number().describe('层号 (1=顶层, 2=底层)'),
     width: z.number().describe('线宽 (mil)'),
-  }, async ({ net, points, layer, width }: { net: string; points: { x: number; y: number }[]; layer: number; width: number }) => {
-    const data = await bridge.command('route_track', { net, points, layer, width });
+    ...routeShapeSchema,
+    clearance: z.number().nonnegative().optional().describe('统一障碍及板框外框间距 mil（默认 6），原生 DRC 仍需检查工程规则'),
+    protectedIndices: z.array(z.number().int().nonnegative()).optional().describe('必须保留的中间连接点下标；已有同网铜上的点也会自动保护'),
+    dryRun: z.boolean().optional().describe('true 只读取并返回整理路径和问题，不创建走线或重建铺铜'),
+  }, async (params: RouteTrackParams) => {
+    const data = await bridge.command('route_track', params);
     return { content: [{ type: 'text' as const, text: JSON.stringify(data ?? { success: true }, null, 2) }] };
+  });
+
+  server.tool('pcb_check_route_geometry', '只读检查已有走线的角度、短线段和转角，区分连接锚点及分支；不修改 PCB', {
+    nets: z.array(z.string()).optional().describe('仅检查这些网络；默认全部'),
+    layer: z.number().optional().describe('仅检查指定铜层'),
+    angleMode: routeShapeSchema.angleMode,
+    cornerStyle: routeShapeSchema.cornerStyle,
+    minSegmentLength: routeShapeSchema.minSegmentLength,
+    angleToleranceDeg: routeShapeSchema.angleToleranceDeg,
+  }, async (params: RouteOptions & {nets?: string[]; layer?: number}) => {
+    const data = await bridge.command('check_route_geometry',params);
+    return {content:[{type:'text' as const,text:JSON.stringify(data,null,2)}]};
   });
 
   server.tool('pcb_create_via', '创建过孔', {

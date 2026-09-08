@@ -9,7 +9,8 @@ import { readFileSync, existsSync, readdirSync, statSync } from 'node:fs';
 import path from 'node:path';
 import { BridgeClient } from '../bridge-client.js';
 import { calcCurrentCapacity } from '../calculators.js';
-import { planRoute, pathLength, expandedBox, segmentBox, type Point, type Box, type CopperObstacle } from '../routing-geometry.js';
+import { planRoute, pathLength, expandedBox, segmentBox, resolveRouteOptions, type RouteOptions, type Point, type Box, type CopperObstacle } from '../routing-geometry.js';
+import { routeShapeSchema } from './routing-schema.js';
 import { parseSourceRecords } from '../source-records.js';
 import { protel2Signature } from '../netlist.js';
 
@@ -18,6 +19,9 @@ interface Comp { designator: string; name: string; x: number; y: number; width: 
 interface Pad { primitiveId: string; net: string; x: number; y: number; designator: string; pinNumber?: string; bbox?: Box; layer?: number; diameter?: number; holeDiameter?: number; }
 interface Track { primitiveId: string; net: string; layer: number | string; startX: number; startY: number; endX: number; endY: number; width: number; }
 interface ViaOptions { viaDrill?: number; viaDiameter?: number }
+type AutoRouteParams = Omit<RouteOptions,'protectedIndices'> & ViaOptions & {
+  nets?: string[]; topLayer?: number; viaLayer?: number; width?: number; clearance?: number; useVias?: boolean; dryRun?: boolean;
+};
 
 function resolveViaSize(params: ViaOptions) {
   const holeDiameter = params.viaDrill ?? 12;
@@ -336,8 +340,9 @@ export async function autoPlaceComponents(bridge: BridgeClient, params: { maxMov
 
 
 
-export async function autoRouteNets(bridge: BridgeClient, params: { nets?: string[]; topLayer?: number; viaLayer?: number; width?: number; clearance?: number; useVias?: boolean } & ViaOptions): Promise<any> {
+export async function autoRouteNets(bridge: BridgeClient, params: AutoRouteParams): Promise<any> {
   const viaSize = resolveViaSize(params);
+  const routingOptions=resolveRouteOptions(params);
   const state:any=await bridge.command('get_state');
   const targets=[...new Set(params.nets?.length?params.nets:(state.nets??[]).map((n:any)=>n.name))] as string[];
   const topLayer=params.topLayer??1, viaLayer=params.viaLayer??2, width=params.width??10, clearance=params.clearance??15;
@@ -350,7 +355,7 @@ export async function autoRouteNets(bridge: BridgeClient, params: { nets?: strin
     throw new Error('已有走线缺少有效坐标或线宽，不能可靠检查障碍');
   const obstacles:CopperObstacle[]=allPads.filter((p:Pad)=>p.bbox).map((p:Pad)=>({bbox:p.bbox!,net:p.net,layer:Number(p.layer)}));
   for(const t of tracks)obstacles.push({bbox:segmentBox({x:t.startX,y:t.startY},{x:t.endX,y:t.endY},t.width),net:t.net,layer:Number(t.layer)});
-  const other:any=await bridge.executeRaw('const out=[]; for(const type of ["Via","Arc","Pour","Fill","Region"]){const api=eda["pcb_Primitive"+type];if(!api?.getAll)continue;for(const row of await api.getAll()){const bbox=await eda.pcb_Primitive.getPrimitivesBBox([row]);if(bbox)out.push({bbox,net:row.getState_Net?.()??"",layer:type==="Via"?12:(row.getState_Layer?.()??12)});}}return out;');
+  const other:any=await bridge.executeRaw('const out=[]; for(const type of ["Via","Arc","Fill","Region"]){const api=eda["pcb_Primitive"+type];if(!api?.getAll)continue;for(const row of await api.getAll()){const bbox=await eda.pcb_Primitive.getPrimitivesBBox([row]);if(!bbox)throw Error("无法读取固定铜或禁布区外框，停止规划");out.push({bbox,net:row.getState_Net?.()??"",layer:type==="Via"?12:(row.getState_Layer?.()??12)});}}return out;');
   obstacles.push(...other);
   if(allPads.some((p:Pad)=>!p.bbox || ![p.x,p.y,p.layer].every(Number.isFinite)))throw new Error('存在无法读取外框、坐标或层号的焊盘，不能规划避障路线');
   const summary:any[]=[];
@@ -363,7 +368,8 @@ export async function autoRouteNets(bridge: BridgeClient, params: { nets?: strin
     const paths:Point[][]=[];
     let failed=false;
     for(let i=1;i<pads.length;i++){
-      const path=planRoute(pads[i-1],pads[i],boxes);
+      const bounds=state.boardBounds ? expandedBox(state.boardBounds,-clearance-width/2) : undefined;
+      const path=planRoute(pads[i-1],pads[i],boxes,routingOptions,bounds);
       if(!path){failed=true;break;}
       if(state.boardBounds && path.some(p=>p.x<state.boardBounds.minX||p.x>state.boardBounds.maxX||p.y<state.boardBounds.minY||p.y>state.boardBounds.maxY)){failed=true;break;}
       paths.push(path);
@@ -375,26 +381,44 @@ export async function autoRouteNets(bridge: BridgeClient, params: { nets?: strin
     }
     if(failed){summary.push({net,pads:pads.length,segments:0,skipped:'候选路径或过孔被障碍阻挡；未生成该网络走线'});continue;}
     let segments=0,vias=0;
+    const writtenPaths: Point[][]=[];
     for(const p of viaPads){
-      await bridge.command('create_via',{net,x:p.x,y:p.y,...viaSize});vias++;
+      if (!params.dryRun) {await bridge.command('create_via',{net,x:p.x,y:p.y,...viaSize});vias++;}
       obstacles.push({bbox:segmentBox(p,p,viaSize.diameter),net,layer:12});
     }
     for(const path of paths){
-      const result:any=await bridge.command('route_track',{net,points:path,layer,width});segments+=result.createdSegments;
-      for(let i=1;i<path.length;i++)obstacles.push({bbox:segmentBox(path[i-1],path[i],width),net,layer});
+      let actualPath=path;
+      if (!params.dryRun) {
+        const result:any=await bridge.command('route_track',{net,points:path,layer,width,clearance,...routingOptions});
+        segments+=result.createdSegments;actualPath=result.points ?? path;
+      }
+      writtenPaths.push(actualPath);
+      for(let i=1;i<actualPath.length;i++)obstacles.push({bbox:segmentBox(actualPath[i-1],actualPath[i],width),net,layer});
     }
     totalTrackSegments+=segments;totalVias+=vias;
-    summary.push({net,pads:pads.length,segments,vias,paths,lengthMil:paths.reduce((s,p)=>s+pathLength(p),0)});
+    summary.push({net,pads:pads.length,segments,vias,paths:writtenPaths,lengthMil:writtenPaths.reduce((s,p)=>s+pathLength(p),0),
+      plannedVias:viaPads.map(p=>({x:p.x,y:p.y,...viaSize}))});
   }
+  if (params.dryRun) return {dryRun:true,plannedNets:summary.filter(r=>r.paths).length,routedNets:0,generatedNets:0,
+    totalTrackSegments:0,totalVias:0,skippedNets:summary.filter(r=>r.skipped).length,nets:summary,routingOptions,
+    note:'仅规划并检查保守障碍；没有创建图元、重建铺铜或运行 DRC。'};
+  let geometry:any;
+  try {geometry=await bridge.command('check_route_geometry',{nets:targets,...routingOptions});}
+  catch (e:any) {geometry={passed:false,error:e.message,issues:[]};}
   let drc:any;
   try { drc=await bridge.command('run_drc'); }
   catch (e:any) { drc={passed:false,detailsAvailable:false,issues:[],error:e.message}; }
   const connectionIssues=(drc.issues??[]).filter((i:any)=>i.connectionError);
-  for(const r of summary)r.connected=!r.skipped&&(drc.detailsAvailable||drc.passed)&&!connectionIssues.some((i:any)=>!i.net||i.net===r.net);
-  return {routedNets:summary.filter(r=>r.connected).length,generatedNets:summary.filter(r=>r.segments>0).length,
+  for(const r of summary) {
+    r.connected=!r.skipped&&(drc.detailsAvailable||drc.passed)&&!connectionIssues.some((i:any)=>!i.net||i.net===r.net);
+    r.geometryPassed=!!geometry && !geometry.error && Array.isArray(geometry.issues)
+      && !geometry.issues.some((i:any)=>i.severity==='error' && (!i.net || i.net===r.net));
+  }
+  return {routedNets:summary.filter(r=>r.connected&&r.geometryPassed).length,generatedNets:summary.filter(r=>r.segments>0).length,
     skippedNets:summary.filter(r=>r.skipped).length,totalTrackSegments,totalVias,totalDetours:summary.filter(r=>r.paths?.some((p:Point[])=>p.length>2)).length,
     mode:params.useVias?'two_layer_escape':'single_layer_obstacle_aware',viaSize:params.useVias?viaSize:null,drcPassed:drc.passed,drcError:drc.error??null,nets:summary,
-    note:'候选路线避开异网焊盘、已有及本轮新走线等外框；无可行路线则跳过。双层模式用目标布线层并在需要换层的焊盘处放通孔。routedNets 来自连接检查，drcPassed 为整板检查结果。'};
+    routingOptions,geometry,geometryPassed:geometry?.passed===true,
+    note:'默认采用 45° 角度约束与倒角，整理后重新检查固定铜外框；无可行路线则跳过。双层模式在焊盘中心放通孔。routedNets 同时要求网络连接与角度检查通过；drcPassed 为整板 DRC。'};
 }
 
 // ─── 13. PCB 网表报告 ───────────────────────────────────────────────
@@ -610,7 +634,7 @@ export function registerProTools(server: any, bridge: BridgeClient) {
     return { content: [{ type: 'text' as const, text: JSON.stringify(data, null, 2) }] };
   });
 
-  server.tool('pcb_auto_route_nets', '自动布线：保守的正交连接草稿，检查铜障碍和端点，失败不强连；useVias 在焊盘处换层，返回 DRC 结果', {
+  server.tool('pcb_auto_route_nets', '自动布线草稿：默认水平/垂直/45°与直角倒角，检查障碍并保留端点；支持 dryRun，写入后返回几何检查及 DRC', {
     nets: z.array(z.string()).optional().describe('要布线的网络列表（默认全部）'),
     topLayer: z.number().optional().describe('布线层（默认 1 顶层）'),
     viaLayer: z.number().optional().describe('换层后的布线层（useVias 时，默认 2 底层）'),
@@ -619,8 +643,10 @@ export function registerProTools(server: any, bridge: BridgeClient) {
     useVias: z.boolean().optional().describe('true=焊盘中心放置过孔并在 viaLayer 布线（需支持盘中过孔）；false=单层'),
     viaDrill: z.number().positive().optional().describe('换层过孔孔径 mil（默认 12，按工程规则调整）'),
     viaDiameter: z.number().positive().optional().describe('换层过孔外径 mil（默认 22，按工程规则调整）'),
-  }, async ({ nets, topLayer, viaLayer, width, clearance, useVias, viaDrill, viaDiameter }: { nets?: string[]; topLayer?: number; viaLayer?: number; width?: number; clearance?: number; useVias?: boolean } & ViaOptions) => {
-    const data = await autoRouteNets(bridge, { nets, topLayer, viaLayer, width, clearance, useVias, viaDrill, viaDiameter });
+    ...routeShapeSchema,
+    dryRun: z.boolean().optional().describe('仅返回规划路径和过孔位置，不修改 PCB'),
+  }, async (params: AutoRouteParams) => {
+    const data = await autoRouteNets(bridge, params);
     return { content: [{ type: 'text' as const, text: JSON.stringify(data, null, 2) }] };
   });
 

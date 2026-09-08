@@ -36,7 +36,7 @@ AI IDE ──stdio(MCP)──> mcp-server ──HTTP /execute──> 官方 Brid
 
 ```bash
 npm install
-npm run port         # 修改 handlers.ts 后重新生成代码模板
+npm run port         # 修改 handlers.ts / routing-geometry.ts 后重新生成模板并做语法自检
 npm run build        # tsc 编译
 npm run start:bridge # （可选）手动启动官方 Bridge Server；MCP server 也会自动拉起
 npm run test:bridge  # 端到端协议冒烟测试（无需真实 EDA，内置 mock）
@@ -74,7 +74,7 @@ Run API Gateway 扩展已连接（顶部菜单出现 **API Gateway**）。
 | ANTHROPIC_API_KEY | — | Anthropic API Key（设置后启用 pcb_agent 工具） |
 | AGENT_MODEL | claude-sonnet-4-20250514 | Agent 使用的模型 |
 
-## 工具清单（59 个）
+## 工具清单（60 个）
 
 ### 状态查询 (9)
 pcb_get_state / pcb_screenshot / pcb_run_drc / pcb_get_tracks / pcb_get_pads
@@ -84,8 +84,10 @@ pcb_get_net_primitives / pcb_get_board_info / pcb_get_feature_support / pcb_ping
 pcb_move_component / pcb_relocate_component / pcb_batch_move / pcb_select_component
 pcb_delete_selected / pcb_create_component
 
-### 走线 / 过孔 (4)
-pcb_route_track / pcb_create_via / pcb_delete_tracks / pcb_delete_via
+### 走线 / 过孔 (5)
+pcb_route_track / pcb_check_route_geometry / pcb_create_via / pcb_delete_tracks / pcb_delete_via
+
+默认角度约束、转角整理、预览参数及验证范围见 [走线路径约束与整理](docs/routing-geometry.md)。
 
 ### 铺铜 / 禁布区 (4)
 pcb_create_copper_pour / pcb_delete_pour / pcb_create_keepout / pcb_delete_keepout
@@ -120,7 +122,7 @@ pcb_bom_export — 导出 PCB BOM（JSON + CSV，按元件名聚合数量/位号
 pcb_net_connectivity_check — 网络连通性检查（标记未布线/单焊盘网络）
 pcb_current_density_report — 各网络载流能力估算（IPC-2221），标记偏低网络
 pcb_fanout_component — 在指定元件带网络焊盘中心创建通孔（盘中过孔模式，需工艺支持）
-pcb_auto_route_nets — 正交连接草稿，检查焊盘及铜图元外框；无可行路线则跳过，单独报告 DRC 结果
+pcb_auto_route_nets — 默认水平/垂直/45°连接草稿，整理直角并复查障碍；可 dryRun，分别报告几何检查及 DRC
 pcb_drc_autofix — DRC 自修复（当前支持丝印冲突自动排列），返回修复前后对比
 
 ### 高级功能 v2 (4，v1.2 新增)

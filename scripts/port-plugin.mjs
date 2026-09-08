@@ -40,6 +40,11 @@ function extractFunctions(src) {
 }
 
 const fns = extractFunctions(source);
+// Shared pure geometry helpers are serialized with EDA handlers as well as
+// imported by the server planner; there is one implementation of the policy.
+for (const [name, fn] of extractFunctions(fs.readFileSync(path.join(ROOT, 'src/routing-geometry.ts'), 'utf8'))) {
+  fns.set(name, fn);
+}
 // 当前官方 API 的维护入口；覆盖归档插件中同名处理器，生成步骤不会丢失修复。
 for (const [name, fn] of extractFunctions(fs.readFileSync(path.join(ROOT, 'src/codegen/handlers.ts'), 'utf8'))) {
   fns.set(name, fn);
@@ -47,7 +52,8 @@ for (const [name, fn] of extractFunctions(fs.readFileSync(path.join(ROOT, 'src/c
 
 // ─── 2. TS → JS（transpileModule 剥离类型）───────────────────────────
 function toJs(tsText) {
-  const out = ts.transpileModule(tsText, {
+  // Exported shared helpers become local declarations inside the EDA closure.
+  const out = ts.transpileModule(tsText.replace(/^export\s+(?:default\s+)?(?=(?:async\s+)?function\b)/, ''), {
     compilerOptions: { target: ts.ScriptTarget.ES2022, module: ts.ModuleKind.ESNext },
     fileName: 'inline.ts',
   });
@@ -89,6 +95,7 @@ const DISPATCH = {
   auto_silkscreen: 'autoSilkscreen',
   move_component: 'moveComponent',
   route_track: 'routeTrack',
+  check_route_geometry: 'checkRouteGeometry',
   create_via: 'createVia',
   delete_via: 'deleteVia',
   get_tracks: 'getTracks',
@@ -190,6 +197,11 @@ for (const e of entries) {
 }
 
 // ─── 6. 自检：每个 action 生成的代码必须可被 AsyncFunction 解析 ─────
+// Useful when preparing a change whose validation must be performed separately.
+if (process.argv.includes('--generate-only')) {
+  console.log('仅生成模板；未运行语法自检。');
+  process.exit(0);
+}
 console.log('\n── 语法自检（new AsyncFunction(eda, code)）──');
 let okCount = 0;
 for (const e of entries) {

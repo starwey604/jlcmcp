@@ -2,6 +2,8 @@
  * their helper dependencies into generated.ts. Keep them independent of Node.
  */
 declare const eda: any;
+import { prepareRoutePath, inspectRoutePath, resolveRouteOptions, expandedBox,
+  type Point, type Box } from '../routing-geometry.js';
 export {};
 
 function stateValue(row: any, key: string, fallback: any = undefined): any {
@@ -161,21 +163,138 @@ async function createVia(params: any): Promise<any> {
   return { primitiveId: stateValue(via, 'PrimitiveId'), net: params.net, x: params.x, y: params.y, holeDiameter, diameter };
 }
 
+async function routeEnvironment(net: string, layer: number, width: number, clearance: number): Promise<any> {
+  const obstacles: Box[] = [], anchors: Box[] = [], unavailable: string[] = [];
+  const { pads } = await getPads();
+  for (const p of pads) {
+    if (p.layer !== layer && p.layer !== 12) continue;
+    if (!p.bbox) {unavailable.push(p.primitiveId);continue;}
+    if (p.net === net) anchors.push(p.bbox);
+    else obstacles.push(expandedBox(p.bbox,clearance+width/2));
+  }
+  // Pours are regenerated after writing. Their boundary boxes must not block
+  // every route on a poured board. Fixed copper/keepout regions remain obstacles.
+  for (const type of ['Line','Via','Arc','Fill','Region']) {
+    const api=eda['pcb_Primitive'+type];
+    if (!api?.getAll) continue;
+    for (const row of await api.getAll()) {
+      const rowLayer=type === 'Via' ? 12 : stateValue(row,'Layer');
+      if (rowLayer !== layer && rowLayer !== 12) continue;
+      const bbox=await primitiveBBox(row);
+      if (!bbox) {unavailable.push(stateValue(row,'PrimitiveId',type));continue;}
+      if (stateValue(row,'Net','') === net) anchors.push(bbox);
+      else obstacles.push(expandedBox(bbox,clearance+width/2));
+    }
+  }
+  if (unavailable.length) throw new Error('无法读取障碍外框，停止走线：'+unavailable.join(','));
+  const outlines=await eda.pcb_PrimitiveLine.getAll(undefined,11);
+  if (eda.pcb_PrimitivePolyline?.getAll) {
+    for (const row of await eda.pcb_PrimitivePolyline.getAll()) if (stateValue(row,'Layer') === 11) outlines.push(row);
+  }
+  const rawBounds=outlines.length ? await eda.pcb_Primitive.getPrimitivesBBox(outlines) : null;
+  const bounds=rawBounds ? expandedBox(rawBounds,-clearance-width/2) : undefined;
+  return {obstacles,anchors,bounds,boardBoundsAvailable:!!bounds};
+}
+
+async function prepareTrack(params: any): Promise<any> {
+  const width=params.width ?? 10, clearance=params.clearance ?? 6;
+  if (!params.net || typeof params.net !== 'string' || !Number.isInteger(params.layer) || params.layer <= 0
+      || !Number.isFinite(width) || width <= 0 || !Number.isFinite(clearance) || clearance < 0)
+    throw new Error('网络、层号、线宽或间距无效');
+  // Validate before any environment read, and keep original index semantics.
+  prepareRoutePath(params.points,params);
+  const env=await routeEnvironment(params.net,params.layer,width,clearance);
+  const protectedIndices=new Set<number>(params.protectedIndices ?? []);
+  params.points.forEach((p: Point,i: number)=>{
+    if (env.anchors.some((b: Box)=>p.x>=b.minX && p.x<=b.maxX && p.y>=b.minY && p.y<=b.maxY)) protectedIndices.add(i);
+  });
+  const prepared=prepareRoutePath(params.points,{...params,protectedIndices:[...protectedIndices]},env.obstacles,env.bounds);
+  if (!env.boardBoundsAvailable) prepared.issues.push({kind:'board_bounds_unavailable',severity:'warning',index:0,
+    message:'没有可读取的板框外框；板边距离需由原生 DRC 核对'});
+  return {...prepared,net:params.net,layer:params.layer,width,clearance,
+    boardBoundsAvailable:env.boardBoundsAvailable,obstacleModel:'conservative_fixed_copper_bboxes',
+    note:'保持连接锚点；间距使用指定的统一 clearance，板框按包围盒检查。铺铜将在写入后重建；此检查不替代原生 DRC。'};
+}
+
 async function routeTrack(params: any): Promise<any> {
-  const width = params.width ?? 10;
-  if (!Array.isArray(params.points) || params.points.length < 2 || !Number.isFinite(width) || width <= 0
-      || !params.points.every((p: any) => Number.isFinite(p.x) && Number.isFinite(p.y))) throw new Error('走线路径或线宽无效');
+  const prepared=await prepareTrack(params);
+  if (params.dryRun) return {...prepared,dryRun:true,createdSegments:0,primitiveIds:[]};
+  if (!prepared.ready) throw new Error('路径预检未通过，未创建走线：'+JSON.stringify(prepared.issues));
+  const width=prepared.width, points: Point[]=prepared.points;
   const ids: string[] = [];
   try {
-    for (let i = 1; i < params.points.length; i++) {
-      const a = params.points[i - 1], b = params.points[i];
+    for (let i = 1; i < points.length; i++) {
+      const a = points[i - 1], b = points[i];
       if (a.x === b.x && a.y === b.y) continue;
       const row = await eda.pcb_PrimitiveLine.create(params.net, params.layer, a.x, a.y, b.x, b.y, width, false);
       if (!row) throw new Error('EDA 未返回走线图元');
       ids.push(stateValue(row, 'PrimitiveId'));
     }
   } catch (error: any) { throw new Error('走线未完成；已创建图元 ' + ids.join(',') + '：' + error.message); }
-  return { createdSegments: ids.length, primitiveIds: ids };
+  const postWriteIssues: any[]=[];
+  try {
+    const pours=eda.pcb_PrimitivePour?.getAll ? await eda.pcb_PrimitivePour.getAll() : [];
+    for (const pour of pours) {
+      try {await pour.rebuildCopperRegion();}
+      catch (e: any) {postWriteIssues.push({kind:'pour_rebuild_failed',message:e.message});}
+    }
+  } catch (e: any) {postWriteIssues.push({kind:'pour_rebuild_failed',message:e.message});}
+  let geometryVerified=false, actualSegments: any[]=[], missingPrimitiveIds: string[]=ids;
+  try {
+    const {tracks}=await getTracks({net:params.net,layer:params.layer});
+    actualSegments=tracks.filter((t: any)=>ids.includes(t.primitiveId));
+    missingPrimitiveIds=ids.filter(id=>!actualSegments.some(t=>t.primitiveId===id));
+    for (const t of actualSegments) {
+      const issues=inspectRoutePath([{x:t.startX,y:t.startY},{x:t.endX,y:t.endY}],prepared.options);
+      postWriteIssues.push(...issues.map(i=>({...i,primitiveId:t.primitiveId})));
+    }
+    // Native joining/splitting can replace IDs. Missing objects must not be
+    // reported as successfully checked; use the whole-board audit after routing.
+    geometryVerified=!missingPrimitiveIds.length && !postWriteIssues.some(i=>i.severity==='error' || i.kind==='pour_rebuild_failed');
+  } catch (e: any) {postWriteIssues.push({kind:'readback_failed',message:e.message});}
+  return {...prepared,dryRun:false,createdSegments:ids.length,primitiveIds:ids,actualSegments,
+    geometryVerified,missingPrimitiveIds,postWriteIssues,requiresDrc:true,
+    verificationScope:'retained_created_segment_angles; use check_route_geometry for junctions and replaced IDs'};
+}
+
+async function checkRouteGeometry(params: any = {}): Promise<any> {
+  if (params.nets !== undefined && (!Array.isArray(params.nets) || params.nets.some((n:any)=>typeof n !== 'string')))
+    throw new Error('nets 必须是网络名称数组');
+  if (params.layer !== undefined && (!Number.isInteger(params.layer) || params.layer <= 0)) throw new Error('层号无效');
+  const options=resolveRouteOptions(params);
+  const {tracks}=await getTracks({layer:params.layer});
+  const filter=new Set<string>(params.nets ?? []);
+  const selected=tracks.filter((t: any)=>t.net && (!filter.size || filter.has(t.net)));
+  const issues: any[]=[],nodes: {net:string;layer:number;point:Point;edges:any[]}[]=[];
+  for (const t of selected) {
+    const a={x:t.startX,y:t.startY},b={x:t.endX,y:t.endY};
+    issues.push(...inspectRoutePath([a,b],options).map(i=>({...i,primitiveIds:[t.primitiveId],net:t.net,layer:t.layer})));
+    for (const [point,other] of [[a,b],[b,a]]) {
+      let node=nodes.find(n=>n.net===t.net && n.layer===t.layer && Math.hypot(n.point.x-point.x,n.point.y-point.y)<=.001);
+      if (!node) {node={net:t.net,layer:t.layer,point,edges:[]};nodes.push(node);}
+      node.edges.push({id:t.primitiveId,other});
+    }
+  }
+  const {pads}=await getPads();
+  const anchors=pads.filter((p:any)=>p.bbox).map((p:any)=>({net:p.net,layer:p.layer,bbox:p.bbox}));
+  for (const v of await eda.pcb_PrimitiveVia.getAll()) {
+    const bbox=await primitiveBBox(v);
+    if (bbox) anchors.push({net:stateValue(v,'Net'),layer:12,bbox});
+  }
+  let junctionsExcluded=0,anchorCorners=0;
+  for (const node of nodes) {
+    if (node.edges.length!==2) {if (node.edges.length>2) junctionsExcluded++;continue;}
+    const atAnchor=anchors.some((a:any)=>a.net===node.net && (a.layer===12 || a.layer===node.layer)
+      && node.point.x>=a.bbox.minX && node.point.x<=a.bbox.maxX && node.point.y>=a.bbox.minY && node.point.y<=a.bbox.maxY);
+    const cornerIssues=inspectRoutePath([node.edges[0].other,node.point,node.edges[1].other],options,
+      atAnchor ? [node.point] : []).filter(i=>['right_angle','sharp_turn','backtrack'].includes(i.kind));
+    if (atAnchor && cornerIssues.length) anchorCorners++;
+    issues.push(...cornerIssues.map(i=>({...i,primitiveIds:node.edges.map(e=>e.id),net:node.net,layer:node.layer,point:node.point})));
+  }
+  return {trackCount:selected.length,issues,passed:!issues.some(i=>i.severity==='error'),
+    errors:issues.filter(i=>i.severity==='error').length,warnings:issues.filter(i=>i.severity==='warning').length,
+    junctionsExcluded,anchorCorners,options,readOnly:true,
+    note:'只检查线段角度、短线段及同层端点处的二度转角；焊盘/过孔锚点转角单独提示，多分支连接不当作普通拐角。'};
 }
 
 async function relocateComponent(params: any): Promise<any> {
